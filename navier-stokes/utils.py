@@ -23,9 +23,106 @@ import datetime
 from time import time
 import os
 import numpy as np
+import logging
 
 # local
 from unet import Unet
+
+
+class Config:
+    
+    # def __init__(self, dataset, debug, overfit, sigma_coef, beta_fn):
+    def __init__(self, args):
+
+        self.dataset = args.dataset
+
+        self.debug = args.debug
+        logging.info(f"DEBUG MODE: {self.debug}\n")
+        
+        # interpolant + sampling
+        self.sigma_coef = args.sigma_coef
+        self.beta_fn = args.beta_fn
+        self.EM_sample_steps = args.EM_sample_steps
+        self.t_min_sampling = 0.0  # no min time needed
+        self.t_max_sampling = .999
+
+        # data
+        if self.dataset == 'cifar':
+
+            self.center_data = True
+            self.C = 3
+            self.H = 32
+            self.W = 32
+            self.num_classes = 10
+            self.data_path = '../data/'
+            self.grid_kwargs = {'normalize' : True, 'value_range' : (-1, 1)}
+
+        elif self.dataset == 'nse':
+
+
+            self.center_data = False
+            self.home = './tmp_images/'
+
+            maybe_create_dir(self.home)
+
+            self.data_fname = 'nse_data_tiny.pt' # to be changed to full data.
+            self.num_classes = args.num_classes
+            self.lo_size = args.lo_size
+            self.hi_size = args.hi_size
+            self.time_lag = args.time_lag
+            self.subsampling_ratio = args.subsampling_ratio
+            self.grid_kwargs = {'normalize': False}
+            self.C = args.C
+            self.H = self.hi_size
+            self.W = self.hi_size
+
+        else:
+            assert False
+
+        # shared
+        self.num_workers = args.num_workers
+        self.delta_t = 0.5
+        self.wandb_project = 'nse'
+        self.wandb_entity = 'jiayx' # TODO: what is this?
+        # self.use_wandb = True
+        self.noise_strength = 1.0
+
+        self.overfit = args.overfit
+        logging.info(f"OVERFIT MODE: {self.overfit}\n")
+
+        if self.debug:
+            self.EM_sample_steps = args.EM_sample_steps
+            self.sample_every = 10
+            self.print_loss_every = 10
+            self.save_every = 10000000
+        else:
+            self.sample_every = args.sample_every
+            self.print_loss_every = args.print_loss_every # 1000
+            self.save_every = args.save_every
+        
+        # some training hparams
+        self.batch_size = 128 if self.dataset == 'cifar' else args.batch_size # TODO: change back to 32? 
+        # self.batch_size = 64
+        if self.overfit:
+            self.batch_size = 8 # TODO: change back to 1 (jiayx)
+        self.sampling_batch_size = self.batch_size if self.dataset=='cifar' else args.sampling_batch_size
+        self.t_min_train = 0.0
+        self.t_max_train = 1.0
+        self.max_grad_norm = 1.0
+        self.base_lr = args.base_lr # (IV. training & sampling)
+        self.max_steps = args.max_steps # 1_000_000 # TODO: change back
+        
+        # arch (III. model)
+        self.unet_use_classes = True if self.dataset == 'cifar' else False
+        self.unet_channels = args.unet_channels
+        self.unet_dim_mults = args.unet_dim_mults
+        self.unet_resnet_block_groups = args.unet_resnet_block_groups
+        self.unet_learned_sinusoidal_dim = args.unet_learned_sinusoidal_dim
+        self.unet_attn_dim_head = args.unet_attn_dim_head
+        self.unet_attn_heads = args.unet_attn_heads
+        self.unet_learned_sinusoidal_cond = args.unet_learned_sinusoidal_cond
+        self.unet_random_fourier_features = args.unet_random_fourier_features
+
 
 def maybe_create_dir(f):
     if not os.path.exists(f):
@@ -159,15 +256,15 @@ def maybe_lag(data, time_lag):
 def maybe_downsample(inputs, outputs, lo_size, hi_size):    
     upsampler = nn.Upsample(scale_factor=int(hi_size/lo_size), mode='nearest')
     hi = interpolate(outputs, size=(hi_size,hi_size),mode='bilinear').reshape([-1,hi_size,hi_size])
-    lo = upsampler(interpolate(inputs, size=(lo_size,lo_size),mode='bilinear'))
+    lo = upsampler(interpolate(inputs, size=(lo_size,lo_size),mode='bilinear')) # TODO: why downsample first and then upsample?
     return lo, hi
 
 def flatten_time(lo, hi, hi_size):
     hi = hi.reshape([-1,hi_size,hi_size])
     lo = lo.reshape([-1,hi_size,hi_size])
     # make the data N C H W
-    hi = hi[:,None,:,:] 
-    lo = lo[:,None,:,:] 
+    hi = hi[:,None,:,:]
+    lo = lo[:,None,:,:]
     return lo, hi
 
 def loader_from_tensor(lo, hi, batch_size, shuffle):
@@ -190,12 +287,43 @@ def get_forecasting_dataloader(config, shuffle = False):
     # here "lo" will be the conditioning info (initial condition) and "hi" will be the target
     # lo is x_t and hi is x_{t+tau}, and lo might be lower res than hi
 
+    logging.info(f"data_raw.shape: {data_raw.shape}")
+    logging.info(f"config.time_lag: {config.time_lag}")
+    logging.info(f"config.lo_size: {config.lo_size}")
+    logging.info(f"config.hi_size: {config.hi_size}")
+    logging.info(f"config.subsampling_ratio: {config.subsampling_ratio}")
+    logging.info(f"config.batch_size: {config.batch_size}")
+
+    logging.info("\n")
+
     lo, hi = maybe_lag(data_raw, config.time_lag)
+
+    logging.info(f"lo.shape after maybe_lag: {lo.shape}")
+    logging.info(f"hi.shape after maybe_lag: {hi.shape}")
+
+    logging.info("\n")
+
     lo, hi = maybe_downsample(lo, hi, config.lo_size, config.hi_size)
+
+    logging.info(f"lo.shape after maybe_downsample: {lo.shape}")
+    logging.info(f"hi.shape after maybe_downsample: {hi.shape}")
+
+    logging.info("\n")
+
     lo, hi = flatten_time(lo, hi, config.hi_size)
+
+    logging.info(f"lo.shape after flatten_time: {lo.shape}")
+    logging.info(f"hi.shape after flatten_time: {hi.shape}")
+
+    logging.info("\n")
 
     lo = maybe_subsample(lo, config.subsampling_ratio)
     hi = maybe_subsample(hi, config.subsampling_ratio)
+
+    logging.info(f"lo.shape after maybe_subsample: {lo.shape}")
+    logging.info(f"hi.shape after maybe_subsample: {hi.shape}")
+
+    logging.info("\n")
 
     # now they are image shaped. Be sure to shuffle to de-correlate neighboring samples when training. 
     loader = loader_from_tensor(lo, hi, config.batch_size, shuffle = shuffle)
@@ -226,3 +354,51 @@ def make_redblue_plots(x, config):
     return out
 
 
+
+
+# BELOW IS THE ORIGINAL CODE (NOT USED)
+
+def main_raw():
+
+    assert False, "why are you using this?!"
+
+    parser = argparse.ArgumentParser(description='hello')
+    parser.add_argument('--dataset', type = str, choices = ['cifar', 'nse'], default = 'nse')
+    parser.add_argument('--load_path', type = str, default = None)
+    parser.add_argument('--use_wandb', type = int, default = 1)
+    parser.add_argument('--sigma_coef', type = float, default = 1.0) 
+    parser.add_argument('--beta_fn', type = str, default = 't^2', choices=['t','t^2'])
+    parser.add_argument('--debug', type = int, default = 0)
+    parser.add_argument('--sample_only', type = int, default = 0)
+    parser.add_argument('--overfit', type = int, default = 0)
+    args = parser.parse_args()
+
+    torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+    torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+
+    # for k in vars(args):
+        # print(k, getattr(args, k)) # TODO: uncomment this
+    
+    # print("************************************************")
+
+    logging.info(f"********* RUNNING at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} *********")
+
+    conf = Config(
+        dataset = args.dataset, 
+        debug = bool(args.debug), # use as desired 
+        overfit = bool(args.overfit),
+        sigma_coef = args.sigma_coef, 
+        beta_fn = args.beta_fn
+    )
+
+    trainer = Trainer(
+        conf, 
+        load_path = args.load_path, # none trains from scratch 
+        sample_only = bool(args.sample_only), 
+        use_wandb = bool(args.use_wandb)
+    )
+
+    if bool(args.sample_only):
+        trainer.sample_ckpt()
+    else:
+        trainer.fit()

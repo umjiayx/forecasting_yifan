@@ -1,0 +1,11 @@
+# __pycache__, ckpts, wandb, tmp_images, logs, 
+__pycache__/
+ckpts/
+wandb/
+tmp_images/
+logs/
+
+# data
+data/
+
+# other

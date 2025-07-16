@@ -1,0 +1,46 @@
+# Command line arguments
+dataset: nse
+debug: true
+overfit: true
+sigma_coef: 1.0
+beta_fn: t^2
+
+# Optional: override others as well
+use_wandb: false
+load_path: null
+sample_only: false
+
+# Datasets
+home: './tmp_images/'
+data_fname: 'nse_data_tiny.pt'
+lo_size: 128
+hi_size: 128
+time_lag: 2
+subsampling_ratio: 1
+C: 1 # number of dataset channels
+num_classes: 1
+
+# Training & sampling
+batch_size: 64
+max_steps: 2000
+base_lr: 0.0002
+sampling_batch_size: 1
+EM_sample_steps: 500
+
+# Logging
+sample_every: 100
+print_loss_every: 50
+save_every: 50
+
+# Other
+num_workers: 4
+
+# Model
+unet_channels: 128
+unet_dim_mults: [1, 2, 2, 2]
+unet_resnet_block_groups: 8
+unet_learned_sinusoidal_dim: 32
+unet_attn_dim_head: 64
+unet_attn_heads: 4
+unet_learned_sinusoidal_cond: true
+unet_random_fourier_features: false

@@ -13,6 +13,9 @@ from torchvision.utils import make_grid
 from PIL import Image
 import math
 import argparse
+from datetime import datetime
+import yaml # jiayx
+from types import SimpleNamespace # jiayx
 
 # local
 from utils import (
@@ -28,6 +31,30 @@ from utils import (
     bad,
 )
 from interpolant import Interpolant
+
+from utils import Config
+
+import logging
+
+
+def setup_logger(save_dir=None, log_level=logging.INFO):
+    if save_dir is None:
+        save_dir = "./logs"
+    os.makedirs(save_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(save_dir, f"log_{timestamp}.txt")
+
+    logging.basicConfig(
+        level=log_level,
+        format="[%(asctime)s] [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler()
+        ]
+    )
+
+    logging.info(f"Logging to {log_path}")
 
 class Trainer:
 
@@ -47,7 +74,7 @@ class Trainer:
 
         self.load_path = load_path
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+        
         if c.dataset == 'cifar':
             self.dataloader = get_cifar_dataloader(c)
 
@@ -67,13 +94,15 @@ class Trainer:
         self.model.to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=c.base_lr)
         self.step = 0
+        self.loss_history = []
       
         if self.load_path is not None:
             self.load()
 
         self.U = torch.distributions.Uniform(low=c.t_min_train, high=c.t_max_train)
         setup_wandb(c)
-        self.print_config()
+        
+        # self.print_config()  # TODO: uncomment this
 
     def save(self,):
         D = {
@@ -84,21 +113,21 @@ class Trainer:
         maybe_create_dir('./ckpts')
         path = f"./ckpts/latest.pt"
         torch.save(D, path)
-        print("saved ckpt at ", path)
+        # print("saved ckpt at ", path)
 
     def load(self,):
         D = torch.load(self.load_path)
         self.model.load_state_dict(D['model_state_dict'])
         self.optimizer.load_state_dict(D['optimizer_state_dict'])
         self.step = D['step']
-        print("loaded! step is", self.step)
+        logging.info(f"loaded! step is {self.step}")
 
     def print_config(self,):
         c = self.config
         for key in vars(c):
             val = getattr(c, key)
             if is_type_for_logging(val):
-                print(key, val)
+                logging.info(f"{key}: {val}")
 
     def get_time(self, D):
         D['t'] = self.U.sample(sample_shape = (D['N'],)).to(self.device)
@@ -166,7 +195,7 @@ class Trainer:
                 tscalar = ts[1] # 0 + (1/500)
 
             if (i+1) % 100 == 0:
-                print("100 sample steps")
+                logging.info("100 sample steps")
             xt, mu = step_fn(xt, tscalar * ones, label = label)
         assert not bad(mu)
         return mu
@@ -176,7 +205,7 @@ class Trainer:
       
         c = self.config
 
-        print("SAMPLING")
+        logging.info("SAMPLING")
 
         self.model.eval()
         
@@ -208,7 +237,7 @@ class Trainer:
         # make samples
         for k in diffusion_fns.keys():
            
-            print('sampling for diffusion function:', k)
+            logging.info('sampling for diffusion function:', k)
             sample = self.EM(diffusion_fn=diffusion_fns[k], **EM_args)
 
             sample = preprocess_fn(sample)
@@ -235,7 +264,7 @@ class Trainer:
         )
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
-        self.step += 1
+        # self.step += 1
         return norm
 
     def image_sq_norm(self, x):
@@ -324,10 +353,10 @@ class Trainer:
         return D
 
     def sample_ckpt(self,):
-        print("not training. just sampling a checkpoint")
+        logging.info("not training. just sampling a checkpoint")
         assert self.config.use_wandb
         self.definitely_sample()
-        print("DONE")
+        logging.info("DONE")
 
     def do_step(self, batch_idx, batch):
 
@@ -335,28 +364,35 @@ class Trainer:
         self.model.train()
         loss = self.training_step(D)
         loss.backward()
+        self.loss_history.append(loss.item())
         grad_norm = self.optimizer_step() # updates self.step 
         self.maybe_sample()
 
         if self.step % self.config.print_loss_every == 0:
-            print(f"Grad step {self.step}. Loss:{loss.item()}")
+            logging.info(f"Grad step {self.step}. Loss: {loss.item():.2f}")
             if self.config.use_wandb:
                 wandb.log({'loss': loss.item(), 'grad_norm': grad_norm}, step = self.step)
 
         if self.step % self.config.save_every == 0:
-            print("saving!")
+            logging.info(f"saving at step {self.step}!")
             self.save()
 
-    def fit(self,):
+        if len(self.loss_history) == 1 or loss.item() <= min(self.loss_history[:-1]):
+            logging.info(f"*** saving best model! Loss is {loss.item():.2f} at step {self.step}. ***")
+            self.save()
+        
+        self.step += 1
 
-        print('starting fit')
+        
+
+    def fit(self,):
 
         is_logging = self.config.use_wandb
 
         if is_logging:
             self.definitely_sample()
 
-        print("starting training")
+        logging.info("\n\n\n*********starting training*********\n\n\n")
         while self.step < self.config.max_steps:
 
             for batch_idx, batch in enumerate(self.dataloader):
@@ -366,124 +402,27 @@ class Trainer:
 
                 self.do_step(batch_idx, batch)
 
-class Config:
-    
-    def __init__(self, dataset, debug, overfit, sigma_coef, beta_fn):
-
-        self.dataset = dataset
-
-        self.debug = debug
-        print("SELF DEBUG IS", self.debug)
-        
-        # interpolant + sampling
-        self.sigma_coef = sigma_coef
-        self.beta_fn = beta_fn
-        self.EM_sample_steps = 500
-        self.t_min_sampling = 0.0  # no min time needed
-        self.t_max_sampling = .999
-
-        # data
-        if self.dataset == 'cifar':
-
-            self.center_data = True
-            self.C = 3
-            self.H = 32
-            self.W = 32
-            self.num_classes = 10
-            self.data_path = '../data/'
-            self.grid_kwargs = {'normalize' : True, 'value_range' : (-1, 1)}
-
-        elif self.dataset == 'nse':
-
-
-            self.center_data = False
-            self.home = './tmp_images/'
-
-            maybe_create_dir(self.home)
-
-            self.data_fname = 'nse_data_tiny.pt'
-            self.num_classes = 1
-            self.lo_size = 64
-            self.hi_size = 128
-            self.time_lag = 2
-            self.subsampling_ratio = 1.0 
-            self.grid_kwargs = {'normalize': False}
-            self.C = 1
-            self.H = self.hi_size
-            self.W = self.hi_size
-
-        else:
-            assert False
-
-
-        # shared
-        self.num_workers = 4
-        self.delta_t = 0.5
-        self.wandb_project = 'nse'
-        self.wandb_entity = 'marikgoldstein'
-        self.use_wandb = True
-        self.noise_strength = 1.0
-
-        self.overfit = overfit
-        print(f"OVERFIT MODE (USEFUL FOR DEBUGGING) IS {self.overfit}")
-
-        if self.debug:
-            self.EM_sample_steps = 10
-            self.sample_every = 10
-            self.print_loss_every = 10
-            self.save_every = 10000000
-        else:
-            self.sample_every = 1000
-            self.print_loss_every = 100 #1000 
-            self.save_every = 1000
-        
-        # some training hparams
-        self.batch_size = 128 if self.dataset == 'cifar' else 32 
-        self.sampling_batch_size = self.batch_size if self.dataset=='cifar' else 4 
-        self.num_workers = 4
-        self.t_min_train = 0.0
-        self.t_max_train = 1.0
-        self.max_grad_norm = 1.0
-        self.base_lr = 2e-4 
-        self.max_steps = 1_000_000
-        
-        # arch
-        self.unet_use_classes = True if self.dataset == 'cifar' else False
-        self.unet_channels = 128
-        self.unet_dim_mults = (1, 2, 2, 2) 
-        self.unet_resnet_block_groups = 8
-        self.unet_learned_sinusoidal_dim = 32
-        self.unet_attn_dim_head = 64
-        self.unet_attn_heads = 4
-        self.unet_learned_sinusoidal_cond = True
-        self.unet_random_fourier_features = False
-
 
 def main():
-
-    parser = argparse.ArgumentParser(description='hello')
-    parser.add_argument('--dataset', type = str, choices = ['cifar', 'nse'], default = 'nse')
-    parser.add_argument('--load_path', type = str, default = None)
-    parser.add_argument('--use_wandb', type = int, default = 1)
-    parser.add_argument('--sigma_coef', type = float, default = 1.0) 
-    parser.add_argument('--beta_fn', type = str, default = 't^2', choices=['t','t^2'])
-    parser.add_argument('--debug', type = int, default = 0)
-    parser.add_argument('--sample_only', type = int, default = 0)
-    parser.add_argument('--overfit', type = int, default = 0)
-    args = parser.parse_args()
-
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 
-    for k in vars(args):
-        print(k, getattr(args, k))
-    conf = Config(
-        dataset = args.dataset, 
-        debug = bool(args.debug), # use as desired 
-        overfit = bool(args.overfit),
-        sigma_coef = args.sigma_coef, 
-        beta_fn = args.beta_fn
-    )
+    setup_logger()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='config.yml')
+    parsed_args = parser.parse_args()
+
+    # make the path to be the folder 'configs' + the config file name
+    config_path = os.path.join('configs', parsed_args.config)
+
+    with open(config_path, 'r') as f:
+        config_dict = yaml.safe_load(f)
+    args = SimpleNamespace(**config_dict)
+
+    logging.info(f"********* RUNNING at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} *********")
+
+    conf = Config(args)
 
     trainer = Trainer(
         conf, 
@@ -496,6 +435,7 @@ def main():
         trainer.sample_ckpt()
     else:
         trainer.fit()
+
 
 if __name__ == '__main__':
     main()

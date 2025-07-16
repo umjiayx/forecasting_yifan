@@ -326,7 +326,7 @@ class Unet(nn.Module):
                 nn.Linear(classes_dim, classes_dim)
             )
         else:
-            print("NOT USING CLASSES IN UNET")
+            # print("NOT USING CLASSES IN UNET (class embeddings are not used)")
             classes_dim = None
 
         # layers
