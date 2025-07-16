@@ -37,7 +37,7 @@ class Config:
         self.dataset = args.dataset
 
         self.debug = args.debug
-        logging.info(f"DEBUG MODE: {self.debug}\n")
+        logging.info(f"DEBUG MODE: {self.debug}")
         
         # interpolant + sampling
         self.sigma_coef = args.sigma_coef
@@ -58,14 +58,25 @@ class Config:
             self.grid_kwargs = {'normalize' : True, 'value_range' : (-1, 1)}
 
         elif self.dataset == 'nse':
-
-
             self.center_data = False
-            self.home = './tmp_images/'
-
+            self.home = args.home
             maybe_create_dir(self.home)
-
-            self.data_fname = 'nse_data_tiny.pt' # to be changed to full data.
+            self.data_fname = args.data_fname # to be changed to full data.
+            self.num_classes = args.num_classes
+            self.lo_size = args.lo_size
+            self.hi_size = args.hi_size
+            self.time_lag = args.time_lag
+            self.subsampling_ratio = args.subsampling_ratio
+            self.grid_kwargs = {'normalize': False}
+            self.C = args.C
+            self.H = self.hi_size
+            self.W = self.hi_size
+        
+        elif self.dataset == 'qg':
+            self.center_data = False
+            self.home = args.home
+            maybe_create_dir(self.home)
+            self.data_fname = args.data_fname
             self.num_classes = args.num_classes
             self.lo_size = args.lo_size
             self.hi_size = args.hi_size
@@ -82,13 +93,13 @@ class Config:
         # shared
         self.num_workers = args.num_workers
         self.delta_t = 0.5
-        self.wandb_project = 'nse'
-        self.wandb_entity = 'jiayx' # TODO: what is this?
+        self.wandb_project = args.wandb_project
+        self.wandb_entity = args.wandb_entity
         # self.use_wandb = True
         self.noise_strength = 1.0
 
         self.overfit = args.overfit
-        logging.info(f"OVERFIT MODE: {self.overfit}\n")
+        logging.info(f"OVERFIT MODE: {self.overfit}")
 
         if self.debug:
             self.EM_sample_steps = args.EM_sample_steps
@@ -225,7 +236,8 @@ class DriftModel(nn.Module):
             use_classes = c.unet_use_classes,
         )
         num_params = np.sum([int(np.prod(p.shape)) for p in self._arch.parameters()])
-        print("Num params in main arch for drift is", f"{num_params:,}")
+        logging.info("\n\n********* NETWORK *********\n\n")
+        logging.info(f"Num params in main arch for drift is {num_params:,}")
 
     def forward(self, zt, t, y, cond=None):
         
@@ -270,19 +282,26 @@ def flatten_time(lo, hi, hi_size):
 def loader_from_tensor(lo, hi, batch_size, shuffle):
     return DataLoader(TensorDataset(lo, hi), batch_size = batch_size, shuffle = shuffle)
 
-def get_forecasting_dataloader(config, shuffle = False):
+
+def compute_avg_pixel_norm(data_raw):
+    return torch.sqrt(torch.mean(data_raw ** 2))
+
+
+def get_forecasting_dataloader_nse(config, shuffle = False):
     data_raw, time_raw = torch.load(config.data_fname)
     del time_raw
     
-
     # better to subsample after flattening time dim to actually affect the num of datapoints rather than num trajectores
     #data_raw = maybe_subsample(data_raw, config.subsampling_ratio)    
     
-    #Ntj, Nts, Nx, Ny = data_raw.size() 
-    #avg_pixel_norm = torch.norm(data_raw,dim=(2,3),p='fro').mean() / np.sqrt(Nx*Ny)
-    avg_pixel_norm = 3.0679163932800293 # avg data norm computed a priori
-    data_raw = data_raw/avg_pixel_norm
+    # avg_pixel_norm = 3.0679163932800293 # avg data norm computed a priori
+    avg_pixel_norm = compute_avg_pixel_norm(data_raw)
+    data = data_raw/avg_pixel_norm
     new_avg_pixel_norm = 1.0
+
+    logging.info("\n\n********* DATA *********\n\n")
+
+    logging.info(f"avg_pixel_norm: {avg_pixel_norm}")
 
     # here "lo" will be the conditioning info (initial condition) and "hi" will be the target
     # lo is x_t and hi is x_{t+tau}, and lo might be lower res than hi
@@ -296,7 +315,7 @@ def get_forecasting_dataloader(config, shuffle = False):
 
     logging.info("\n")
 
-    lo, hi = maybe_lag(data_raw, config.time_lag)
+    lo, hi = maybe_lag(data, config.time_lag)
 
     logging.info(f"lo.shape after maybe_lag: {lo.shape}")
     logging.info(f"hi.shape after maybe_lag: {hi.shape}")
@@ -328,6 +347,62 @@ def get_forecasting_dataloader(config, shuffle = False):
     # now they are image shaped. Be sure to shuffle to de-correlate neighboring samples when training. 
     loader = loader_from_tensor(lo, hi, config.batch_size, shuffle = shuffle)
     return loader, avg_pixel_norm, new_avg_pixel_norm
+
+
+def get_forecasting_dataloader_qg(config, shuffle = False):
+    data_raw = torch.load(config.data_fname)
+    data_raw = data_raw.float()
+
+    # better to subsample after flattening time dim to actually affect the num of datapoints rather than num trajectores
+    #data_raw = maybe_subsample(data_raw, config.subsampling_ratio)    
+    
+    # avg_pixel_norm = 3.0679163932800293 # avg data norm computed a priori
+    avg_pixel_norm = compute_avg_pixel_norm(data_raw)
+    data = data_raw/avg_pixel_norm
+    new_avg_pixel_norm = 1.0
+
+    logging.info("\n\n********* DATA *********\n\n")
+
+    logging.info(f"avg_pixel_norm: {avg_pixel_norm}")
+
+    # here "lo" will be the conditioning info (initial condition) and "hi" will be the target
+    # lo is x_t and hi is x_{t+tau}, and lo might be lower res than hi
+
+    logging.info(f"data_raw.shape: {data_raw.shape}")
+    logging.info(f"config.time_lag: {config.time_lag}")
+    logging.info(f"config.lo_size: {config.lo_size}")
+    logging.info(f"config.hi_size: {config.hi_size}")
+    logging.info(f"config.subsampling_ratio: {config.subsampling_ratio}")
+    logging.info(f"config.batch_size: {config.batch_size}")
+
+    logging.info("\n")
+
+    lo, hi = maybe_lag(data, config.time_lag)
+
+    logging.info(f"lo.shape after maybe_lag: {lo.shape}")
+    logging.info(f"hi.shape after maybe_lag: {hi.shape}")
+
+    logging.info("\n")
+
+    lo, hi = flatten_time(lo, hi, config.hi_size)
+
+    logging.info(f"lo.shape after flatten_time: {lo.shape}")
+    logging.info(f"hi.shape after flatten_time: {hi.shape}")
+
+    logging.info("\n")
+
+    lo = maybe_subsample(lo, config.subsampling_ratio)
+    hi = maybe_subsample(hi, config.subsampling_ratio)
+
+    logging.info(f"lo.shape after maybe_subsample: {lo.shape}")
+    logging.info(f"hi.shape after maybe_subsample: {hi.shape}")
+
+    logging.info("\n")
+
+    # now they are image shaped. Be sure to shuffle to de-correlate neighboring samples when training. 
+    loader = loader_from_tensor(lo, hi, config.batch_size, shuffle = shuffle)
+    return loader, avg_pixel_norm, new_avg_pixel_norm
+
 
 def make_one_redblue_plot(x, fname):
     plt.ioff()
@@ -376,10 +451,10 @@ def main_raw():
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 
-    # for k in vars(args):
-        # print(k, getattr(args, k)) # TODO: uncomment this
+    for k in vars(args):
+        logging.info(f"{k}: {getattr(args, k)}")
     
-    # print("************************************************")
+    logging.info("************************************************")
 
     logging.info(f"********* RUNNING at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} *********")
 

@@ -24,7 +24,8 @@ from utils import (
     maybe_create_dir,
     clip_grad_norm, 
     get_cifar_dataloader, 
-    get_forecasting_dataloader,
+    get_forecasting_dataloader_nse,
+    get_forecasting_dataloader_qg,
     make_redblue_plots,
     setup_wandb, 
     DriftModel, 
@@ -37,14 +38,26 @@ from utils import Config
 import logging
 
 
-def setup_logger(save_dir=None, log_level=logging.INFO):
+import logging
+import os
+from datetime import datetime
+import shutil
+
+def setup_logger(save_dir=None, log_level=logging.INFO, config_path=None):
+    # Create top-level log directory
     if save_dir is None:
         save_dir = "./logs"
     os.makedirs(save_dir, exist_ok=True)
 
+    # Create timestamped subfolder
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(save_dir, f"log_{timestamp}.txt")
+    run_dir = os.path.join(save_dir, timestamp)
+    os.makedirs(run_dir, exist_ok=True)
 
+    # Setup log file path
+    log_path = os.path.join(run_dir, "log.txt")
+
+    # Configure logging
     logging.basicConfig(
         level=log_level,
         format="[%(asctime)s] [%(levelname)s] %(message)s",
@@ -55,6 +68,17 @@ def setup_logger(save_dir=None, log_level=logging.INFO):
     )
 
     logging.info(f"Logging to {log_path}")
+
+    # Save config file if provided
+    if config_path is not None:
+        try:
+            config_save_path = os.path.join(run_dir, "config.yml")
+            shutil.copy(config_path, config_save_path)
+            logging.info(f"Saved config file to {config_save_path}")
+        except Exception as e:
+            logging.error(f"Failed to save config file: {e}")
+
+    return run_dir  # you can return the folder path for saving models/checkpoints etc.
 
 class Trainer:
 
@@ -79,13 +103,21 @@ class Trainer:
             self.dataloader = get_cifar_dataloader(c)
 
         elif c.dataset == 'nse':
-            self.dataloader, old_pixel_norm, new_pixel_norm = get_forecasting_dataloader(c)
+            self.dataloader, old_pixel_norm, new_pixel_norm = get_forecasting_dataloader_nse(c)
             c.old_pixel_norm = old_pixel_norm
             c.new_pixel_norm = new_pixel_norm
             # NOTE: if doing anything with the samples other than wandb plotting,
             # e.g. if computing metrics like spectra
             # must scale the output by old_pixel_norm to put it back into data space
             # we model the data divided by old_pixel_norm
+        
+        elif c.dataset == 'qg':
+            self.dataloader, old_pixel_norm, new_pixel_norm = get_forecasting_dataloader_qg(c)
+            c.old_pixel_norm = old_pixel_norm
+            c.new_pixel_norm = new_pixel_norm
+
+        else:
+            assert False, "dataset must be 'cifar', 'nse', or 'qg'"
 
         self.overfit_batch = next(iter(self.dataloader))
 
@@ -102,18 +134,20 @@ class Trainer:
         self.U = torch.distributions.Uniform(low=c.t_min_train, high=c.t_max_train)
         setup_wandb(c)
         
-        # self.print_config()  # TODO: uncomment this
+        self.print_config()  # TODO: uncomment this
 
-    def save(self,):
+    def save_ckpt(self, best_model = False):
         D = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'step': self.step,
         }
+        if best_model:
+            path = f"./ckpts/best.pt"
+        else:
+            path = f"./ckpts/latest.pt"
         maybe_create_dir('./ckpts')
-        path = f"./ckpts/latest.pt"
         torch.save(D, path)
-        # print("saved ckpt at ", path)
 
     def load(self,):
         D = torch.load(self.load_path)
@@ -123,6 +157,7 @@ class Trainer:
         logging.info(f"loaded! step is {self.step}")
 
     def print_config(self,):
+        logging.info("\n\n********* CONFIG *********\n\n")
         c = self.config
         for key in vars(c):
             val = getattr(c, key)
@@ -224,7 +259,7 @@ class Trainer:
             preprocess_fn = lambda x : to_grid(x, c.grid_kwargs)
 
         else:
-            assert c.dataset == 'nse'
+            assert c.dataset == 'nse' or c.dataset == 'qg'
             preprocess_fn = lambda x: to_grid(make_redblue_plots(x, c), c.grid_kwargs)
 
 
@@ -296,6 +331,23 @@ class Trainer:
         y = None
         D = {'z0': xlo, 'z1': xhi, 'label': y, 'N': N}
         return D
+    
+    @torch.no_grad()
+    def prepare_batch_qg(self, batch = None, for_sampling = False):
+        assert not self.config.center_data
+
+        xlo, xhi = batch
+
+        if for_sampling:
+            xlo = xlo[:self.config.sampling_batch_size]
+            xhi = xhi[:self.config.sampling_batch_size]
+
+        xlo, xhi = xlo.to(self.device), xhi.to(self.device)
+
+        N = xlo.shape[0]
+        y = None
+        D = {'z0': xlo, 'z1': xhi, 'label': y, 'N': N}
+        return D
 
     @torch.no_grad()
     def prepare_batch_cifar(self, batch = None, for_sampling = False):
@@ -320,19 +372,20 @@ class Trainer:
 
         return D
 
-
     @torch.no_grad()
     def prepare_batch(self, batch = None, for_sampling = False):
-
-        
         if batch is None or self.config.overfit:
             batch = self.overfit_batch
 
         # get (z0, z1, label, N)
         if self.config.dataset == 'cifar':
             D = self.prepare_batch_cifar(batch, for_sampling = for_sampling) 
-        else:
+        elif self.config.dataset == 'nse':
             D = self.prepare_batch_nse(batch, for_sampling = for_sampling)
+        elif self.config.dataset == 'qg':
+            D = self.prepare_batch_qg(batch, for_sampling = for_sampling)
+        else:
+            assert False, "dataset must be 'cifar', 'nse', or 'qg'"
 
         # get random batch of times
         D = self.get_time(D)
@@ -375,11 +428,11 @@ class Trainer:
 
         if self.step % self.config.save_every == 0:
             logging.info(f"saving at step {self.step}!")
-            self.save()
+            self.save_ckpt(best_model = False)
 
         if len(self.loss_history) == 1 or loss.item() <= min(self.loss_history[:-1]):
             logging.info(f"*** saving best model! Loss is {loss.item():.2f} at step {self.step}. ***")
-            self.save()
+            self.save_ckpt(best_model = True)
         
         self.step += 1
 
@@ -392,7 +445,7 @@ class Trainer:
         if is_logging:
             self.definitely_sample()
 
-        logging.info("\n\n\n*********starting training*********\n\n\n")
+        logging.info("\n\n********* STARTING TRAINING *********\n\n")
         while self.step < self.config.max_steps:
 
             for batch_idx, batch in enumerate(self.dataloader):
@@ -407,7 +460,6 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 
-    setup_logger()
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='config.yml')
@@ -415,12 +467,14 @@ def main():
 
     # make the path to be the folder 'configs' + the config file name
     config_path = os.path.join('configs', parsed_args.config)
+    
+    setup_logger(config_path=config_path)
 
     with open(config_path, 'r') as f:
         config_dict = yaml.safe_load(f)
     args = SimpleNamespace(**config_dict)
 
-    logging.info(f"********* RUNNING at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} *********")
+    logging.info(f"********* RUNNING at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} using config {parsed_args.config} *********")
 
     conf = Config(args)
 
