@@ -1,0 +1,29 @@
+data_path: '/scratch/qingqu_root/qingqu/jiayx/QG/qg_full_test.pt'
+model_path: './models'
+
+
+# mode: 'eval'
+mode: 'train'
+
+
+input_size: 1
+window: 1
+latent_channels: [8, 16, 32, 64, 128]
+kernel_sizes: [5, 5, 5, 5, 5]
+
+base_lr: 0.0001 # 0.0002
+
+device: 'cuda:0'
+
+train_ratio: 0.8
+val_ratio: 0.1
+
+
+print_every: 50
+validate_every: 50
+max_steps: 1_00_000
+
+batch_size: 512
+num_workers: 4
+
+flatten: true
