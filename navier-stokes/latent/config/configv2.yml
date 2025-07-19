@@ -2,8 +2,8 @@ data_path: '/scratch/qingqu_root/qingqu/jiayx/QG/qg_full.pt'
 model_path: './models'
 
 
-mode: 'train'
-# mode: 'eval'
+# mode: 'train'
+mode: 'eval'
 
 
 input_size: 1

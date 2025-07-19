@@ -17,16 +17,16 @@ class Trainer:
         self.last_val_loss = None
         self.device = args['device']
 
-        self.trainloader, self.valloader, self.testloader = get_loader_qg(args)
-        self.overfit_batch, _ = next(iter(self.trainloader))
+        self.trainloader, self.valloader, _ = get_loader_qg(args)
+        self.overfit_batch = next(iter(self.trainloader))
         self.overfit_batch = self.overfit_batch.to(self.device)
 
-        logging.info("overfit_batch.shape", self.overfit_batch.shape)
-        logging.info("overfit_batch.device", self.overfit_batch.device)
-        logging.info("overfit_batch.dtype", self.overfit_batch.dtype)
+        logging.info(f"overfit_batch.shape: {self.overfit_batch.shape}")
+        logging.info(f"overfit_batch.device: {self.overfit_batch.device}")
+        logging.info(f"overfit_batch.dtype: {self.overfit_batch.dtype}")
 
         self.model = get_model(args)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args['base_lr'])
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args['base_lr'], weight_decay=args['weight_decay'])
 
     def loss_fn(self, x_recon, x):
         # self-reconstruction loss
@@ -35,8 +35,10 @@ class Trainer:
 
     def training_step(self, batch):
         self.model.train()
-        x, _ = batch
+        x = batch
         x = x.to(self.device)
+
+        # logging.info(f"x.shape: {x.shape}")
 
         z = self.model.encoder(x)
         x_recon = self.model.decoder(z)
@@ -73,7 +75,7 @@ class Trainer:
 
         with torch.no_grad():
             for batch in self.valloader:
-                x, _ = batch
+                x = batch
                 x = x.to(self.device)
                 z = self.model.encoder(x)
                 x_recon = self.model.decoder(z)
@@ -139,7 +141,8 @@ if __name__ == "__main__":
     with open(config_filepath, 'r') as f:
         args = yaml.load(f, Loader=yaml.FullLoader)
 
-    setup_logger(save_dir=args['model_path'], log_level=logging.INFO, config_path=config_filepath)
+    log_dir = setup_logger(log_level=logging.INFO, config_path=config_filepath)
+    args['log_dir'] = log_dir
 
     if args['mode'] == 'eval':
         evaluate(args)

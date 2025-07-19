@@ -1,19 +1,19 @@
 # Command line arguments
-dataset: nse
-debug: true
-overfit: true
+dataset: 'qg'
+debug: false
+overfit: false
 sigma_coef: 1.0
 beta_fn: t^2
 
 # Optional: override others as well
-use_wandb: false
-load_path: null
-sample_only: false
+use_wandb: true
+load_path: './ckpts_qg_full/best.pt'
+sample_only: true
 
 # Datasets
 home: './tmp_images/'
-data_fname: 'nse_data_tiny.pt'
-lo_size: 64
+data_fname: '/scratch/qingqu_root/qingqu/jiayx/QG/qg_full_test.pt'
+lo_size: 128
 hi_size: 128
 time_lag: 2
 subsampling_ratio: 1
@@ -22,23 +22,23 @@ num_classes: 1
 
 # Training & sampling
 batch_size: 64
-max_steps: 2000
+max_steps: 100000
 base_lr: 0.0002
 sampling_batch_size: 1
 EM_sample_steps: 500
 val_ratio: 0.05
-validate_every: 10
+validate_every: 20
 
 # Logging
 sample_every: 100
-print_loss_every: 50
-save_every: 50
-ckpt_dir: './ckpts_nse'
+print_loss_every: 10
+save_every: 100
+ckpt_dir: './ckpts_qg_full'
 
 # Other
 num_workers: 4
-wandb_project: 'nse'
-wandb_entity: 'jiayx'
+wandb_project: 'qg'
+wandb_entity: 'jiayx18-university-of-michigan'
 
 # Model
 unet_channels: 128

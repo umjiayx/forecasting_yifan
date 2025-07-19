@@ -14,6 +14,9 @@ from PIL import Image
 import math
 import argparse
 from datetime import datetime
+import logging
+
+import shutil
 import yaml # jiayx
 from types import SimpleNamespace # jiayx
 
@@ -35,13 +38,6 @@ from interpolant import Interpolant
 
 from utils import Config
 
-import logging
-
-
-import logging
-import os
-from datetime import datetime
-import shutil
 
 def setup_logger(save_dir=None, log_level=logging.INFO, config_path=None):
     # Create top-level log directory
@@ -100,10 +96,10 @@ class Trainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         if c.dataset == 'cifar':
-            self.dataloader = get_cifar_dataloader(c)
+            self.train_loader = get_cifar_dataloader(c)
 
         elif c.dataset == 'nse':
-            self.dataloader, old_pixel_norm, new_pixel_norm = get_forecasting_dataloader_nse(c)
+            self.train_loader, self.val_loader, old_pixel_norm, new_pixel_norm = get_forecasting_dataloader_nse(c)
             c.old_pixel_norm = old_pixel_norm
             c.new_pixel_norm = new_pixel_norm
             # NOTE: if doing anything with the samples other than wandb plotting,
@@ -112,21 +108,25 @@ class Trainer:
             # we model the data divided by old_pixel_norm
         
         elif c.dataset == 'qg':
-            self.dataloader, old_pixel_norm, new_pixel_norm = get_forecasting_dataloader_qg(c)
+            self.train_loader, self.val_loader, old_pixel_norm, new_pixel_norm = get_forecasting_dataloader_qg(c)
             c.old_pixel_norm = old_pixel_norm
             c.new_pixel_norm = new_pixel_norm
 
         else:
             assert False, "dataset must be 'cifar', 'nse', or 'qg'"
 
-        self.overfit_batch = next(iter(self.dataloader))
+        self.overfit_batch = next(iter(self.train_loader))
 
         self.model = DriftModel(c)
 
         self.model.to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=c.base_lr)
         self.step = 0
-        self.loss_history = []
+        self.train_loss_history = []
+        self.val_loss_history = []
+        self.val_ratio = c.val_ratio
+        self.best_val_loss = float('inf')
+        self.last_val_loss = None
       
         if self.load_path is not None:
             self.load()
@@ -143,10 +143,10 @@ class Trainer:
             'step': self.step,
         }
         if best_model:
-            path = f"./ckpts/best.pt"
+            path = f"{self.config.ckpt_dir}/best.pt"
         else:
-            path = f"./ckpts/latest.pt"
-        maybe_create_dir('./ckpts')
+            path = f"{self.config.ckpt_dir}/latest.pt"
+        maybe_create_dir(self.config.ckpt_dir)
         torch.save(D, path)
 
     def load(self,):
@@ -252,7 +252,7 @@ class Trainer:
         # None means use the one you trained with
         diffusion_fns = {
             'g_sigma': None,
-            'g_other': lambda t: c.sigma_coef * self.wide(1-t).pow(4),
+            # 'g_other': lambda t: c.sigma_coef * self.wide(1-t).pow(4),
         }
        
         if c.dataset == 'cifar':
@@ -262,9 +262,15 @@ class Trainer:
             assert c.dataset == 'nse' or c.dataset == 'qg'
             preprocess_fn = lambda x: to_grid(make_redblue_plots(x, c), c.grid_kwargs)
 
+        logging.info(f"D['z1'].shape: {D['z1'].shape}") # (4, 1, 128, 128)
+        logging.info(f"D['z0'].shape: {D['z0'].shape}") # (4, 1, 128, 128)
 
         z1 = preprocess_fn(D['z1'])
         z0 = preprocess_fn(D['z0'])
+
+        logging.info(f"z1.shape: {z1.shape}") # (3, 508, 506)
+        logging.info(f"z0.shape: {z0.shape}") # (3, 508, 506)
+
         cond = preprocess_fn(D['cond'])
 
         plotD = {}
@@ -272,7 +278,7 @@ class Trainer:
         # make samples
         for k in diffusion_fns.keys():
            
-            logging.info('sampling for diffusion function:', k)
+            logging.info(f'sampling for diffusion function: {k}')
             sample = self.EM(diffusion_fn=diffusion_fns[k], **EM_args)
 
             sample = preprocess_fn(sample)
@@ -293,7 +299,7 @@ class Trainer:
             self.definitely_sample()
 
     def optimizer_step(self,):
-        norm = clip_grad_norm(
+        norm = clip_grad_norm( # TODO: What is this?
             self.model, 
             max_norm = self.config.max_grad_norm
         )
@@ -307,6 +313,12 @@ class Trainer:
 
     def training_step(self, D):
         assert self.model.training
+        model_out = self.model(D['zt'], D['t'], D['label'], cond = D['cond'])
+        target = D['drift_target']
+        return self.image_sq_norm(model_out - target).mean()
+    
+    def compute_val_loss(self, D):
+        assert self.model.eval()
         model_out = self.model(D['zt'], D['t'], D['label'], cond = D['cond'])
         target = D['drift_target']
         return self.image_sq_norm(model_out - target).mean()
@@ -405,38 +417,110 @@ class Trainer:
    
         return D
 
+    @torch.no_grad()
+    def run_validation(self):
+        self.model.eval()
+        val_losses = []
+
+        for batch in self.val_loader:
+            D = self.prepare_batch(batch)
+            loss = self.compute_val_loss(D)
+            val_losses.append(loss.item())
+
+        avg_val_loss = sum(val_losses) / len(val_losses)
+        # logging.info(f"[Validation] Step {self.step} | Avg Val Loss: {avg_val_loss:.4f}")
+
+        if self.config.use_wandb:
+            wandb.log({'val_loss': avg_val_loss}, step=self.step)
+
+        return avg_val_loss
+
     def sample_ckpt(self,):
         logging.info("not training. just sampling a checkpoint")
         assert self.config.use_wandb
         self.definitely_sample()
         logging.info("DONE")
 
-    def do_step(self, batch_idx, batch):
+    def do_step_old(self, batch_idx, batch):
 
         D = self.prepare_batch(batch)
         self.model.train()
         loss = self.training_step(D)
         loss.backward()
-        self.loss_history.append(loss.item())
+        self.train_loss_history.append(loss.item())
         grad_norm = self.optimizer_step() # updates self.step 
         self.maybe_sample()
 
         if self.step % self.config.print_loss_every == 0:
-            logging.info(f"Grad step {self.step}. Loss: {loss.item():.2f}")
+            logging.info(f"[Training] Step {self.step} | Training loss: {loss.item():.2f}")
             if self.config.use_wandb:
-                wandb.log({'loss': loss.item(), 'grad_norm': grad_norm}, step = self.step)
+                wandb.log({'training_loss': loss.item(), 'grad_norm': grad_norm}, step = self.step)
 
         if self.step % self.config.save_every == 0:
             logging.info(f"saving at step {self.step}!")
             self.save_ckpt(best_model = False)
 
-        if len(self.loss_history) == 1 or loss.item() <= min(self.loss_history[:-1]):
-            logging.info(f"*** saving best model! Loss is {loss.item():.2f} at step {self.step}. ***")
-            self.save_ckpt(best_model = True)
+        if self.step % self.config.validate_every == 0:
+            val_loss = self.run_validation()
+            self.val_loss_history.append(val_loss)
+            if val_loss < self.best_val_loss:
+                logging.info(f"*** saving best model! Val loss improved to {val_loss:.4f} at step {self.step}. ***")
+                self.save_ckpt(best_model=True)
+                self.best_val_loss = val_loss
         
         self.step += 1
 
-        
+        # save the training and validation loss history to the log folder as a npy file
+        np.save(f"{self.config.log_dir}/train_loss_history.npy", np.array(self.train_loss_history))
+        np.save(f"{self.config.log_dir}/val_loss_history.npy", np.array(self.val_loss_history))
+
+    def do_step(self, batch_idx, batch):
+        # Prepare batch and compute training loss
+        D = self.prepare_batch(batch)
+        self.model.train()
+        loss = self.training_step(D)
+        loss.backward()
+        self.train_loss_history.append(loss.item())
+        grad_norm = self.optimizer_step()
+        self.maybe_sample()
+
+        # Check if we should run validation
+        if self.step % self.config.validate_every == 0:
+            val_loss = self.run_validation()
+            self.val_loss_history.append(val_loss)
+            self.last_val_loss = val_loss  # update the last known val loss
+
+            if val_loss < self.best_val_loss:
+                logging.info(f"*** Saving best model! Val loss improved to {val_loss:.4f} at step {self.step}. ***")
+                self.save_ckpt(best_model=True)
+                self.best_val_loss = val_loss
+        else:
+            # Reuse last validation loss to keep histories aligned
+            if self.last_val_loss is not None:
+                self.val_loss_history.append(self.last_val_loss)
+            else:
+                self.val_loss_history.append(float("nan"))  # TODO: check if there is nan, I think this is not needed
+
+        # Logging
+        if self.step % self.config.print_loss_every == 0:
+            logging.info(f"Step {self.step} | Training loss: {loss.item():.4f} | Val loss: {self.val_loss_history[-1]:.4f}\n")
+            if self.config.use_wandb:
+                wandb.log({
+                    'training_loss': loss.item(),
+                    'val_loss': self.val_loss_history[-1],
+                    'grad_norm': grad_norm
+                }, step=self.step)
+
+        # Save checkpoint regularly
+        if self.step % self.config.save_every == 0:
+            logging.info(f"Regularly saving model at step {self.step}\n")
+            self.save_ckpt(best_model=False)
+
+        self.step += 1
+
+        # save the training and validation loss history to the log folder as a npy file
+        np.save(f"{self.config.log_dir}/train_loss_history.npy", np.array(self.train_loss_history))
+        np.save(f"{self.config.log_dir}/val_loss_history.npy", np.array(self.val_loss_history))
 
     def fit(self,):
 
@@ -448,7 +532,7 @@ class Trainer:
         logging.info("\n\n********* STARTING TRAINING *********\n\n")
         while self.step < self.config.max_steps:
 
-            for batch_idx, batch in enumerate(self.dataloader):
+            for batch_idx, batch in enumerate(self.train_loader):
  
                 if self.step >= self.config.max_steps:
                     return
@@ -468,7 +552,7 @@ def main():
     # make the path to be the folder 'configs' + the config file name
     config_path = os.path.join('configs', parsed_args.config)
     
-    setup_logger(config_path=config_path)
+    log_dir = setup_logger(config_path=config_path)
 
     with open(config_path, 'r') as f:
         config_dict = yaml.safe_load(f)
@@ -477,6 +561,7 @@ def main():
     logging.info(f"********* RUNNING at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} using config {parsed_args.config} *********")
 
     conf = Config(args)
+    conf.log_dir = log_dir
 
     trainer = Trainer(
         conf, 

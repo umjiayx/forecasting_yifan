@@ -1,6 +1,6 @@
 # __pycache__, ckpts, wandb, tmp_images, logs, 
 __pycache__/
-ckpts/
+ckpts*
 wandb/
 tmp_images/
 logs/
@@ -8,4 +8,5 @@ logs/
 # data
 data/
 
+models*
 # other

@@ -30,13 +30,17 @@ def get_model(args):
 
 def maybe_create_dir(f):
     if not os.path.exists(f):
-        logging.info("making", f)
+        logging.info(f"making: {f}")
         os.makedirs(f)
+
+
+def compute_avg_pixel_norm(data_raw):
+    return torch.sqrt(torch.mean(data_raw ** 2))
 
 
 class TrajectoryDataset(Dataset):
     '''
-    data: (N, T, C, H, W)
+    data: (N, T, H, W)
     window: int
     flatten: bool
     '''
@@ -46,28 +50,34 @@ class TrajectoryDataset(Dataset):
         self.window = window
         self.flatten = flatten
 
-        assert data.ndim == 5, "data must be of shape (N, T, C, H, W)"
+        assert data.ndim == 4, "data must be of shape (N, T, H, W)"
+
+        assert self.flatten, "flatten must be True"
+
+        if self.flatten:
+            self.data = self.data.flatten(0, 1)
+            self.data = self.data.unsqueeze(1) # add channel dimension
+
+        # logging.info(f"data.shape HERE: {self.data.shape}") # (N*T, H, W)
 
     def __len__(self):
         return len(self.data)
     
-    def __getitem__(self, idx) -> Tuple[Tensor, Dict]:
+    def __getitem__(self, idx) -> Tensor:
         
-        # pick the idx-th trajectory
-        x = self.data[idx]
-
+        x = self.data
+        
+        #logging.info(f"x.shape BEFORE: {x.shape}")
+        
         if self.window is not None:
-            start_idx = torch.randint(0, len(x) - self.window + 1, ())
-            x = torch.narrow(x, dim=0, start=start_idx, length=self.window)
-        
-        if self.flatten:
-            return x.flatten(0, 1), {}
+            x = torch.narrow(x, dim=0, start=idx, length=self.window)
         else:
-            return x, {}
+            x = x[idx].unsqueeze(0) # (1, 1, H, W)
 
+        # logging.info(f"x.shape HERE: {x.shape}") # (window, C, H, W)
 
-def compute_avg_pixel_norm(data_raw):
-    return torch.sqrt(torch.mean(data_raw ** 2))
+        return x.flatten(0, 1)
+
 
 def get_loader_qg(args):
     window = args['window']
@@ -76,37 +86,36 @@ def get_loader_qg(args):
     num_workers = args['num_workers']
     data = torch.load(args['data_path'])
     
-    logging.info("data.shape", data.shape)
+    logging.info(f"data.shape: {data.shape}")
 
     data = data.float()
 
     avg_pixel_norm = compute_avg_pixel_norm(data)
-    logging.info("avg_pixel_norm", avg_pixel_norm) # 0.6352
+    logging.info(f"avg_pixel_norm: {avg_pixel_norm}") # 0.6352
 
     data = data/avg_pixel_norm
     new_avg_pixel_norm = 1.0
     data = data * new_avg_pixel_norm
 
-    # (N, T, H, W) -> (N, T, C, H, W)
-    data = data.unsqueeze(2)
-
     i = int(args['train_ratio'] * data.shape[0]) # 0.8
     j = int(args['val_ratio'] * data.shape[0]) # 0.1
 
-    # shape: (N, T, C, H, W) 
+    # shape: (N, T, H, W) 
     train_data = data[:i]
     val_data = data[i:i+j]
-    test_data = data[i+j:]
+    # test_data = data[i+j:]
 
     trainset = TrajectoryDataset(train_data, window=window, flatten=flatten)
     valset = TrajectoryDataset(val_data, window=window, flatten=flatten)
-    testset = TrajectoryDataset(test_data, window=window, flatten=flatten)
+    #testset = TrajectoryDataset(test_data, window=window, flatten=flatten)
 
     trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
     valloader = DataLoader(valset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    testloader = DataLoader(testset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    # testloader = DataLoader(testset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
 
-    return trainloader, valloader, testloader
+    logging.info(f"trainloader.shape: {next(iter(trainloader)).shape}")
+
+    return trainloader, valloader, None
 
 
 
@@ -127,19 +136,17 @@ def evaluate_vae(args):
     test_x = x[j:]
     test_x = test_x.unsqueeze(2)
 
-    logging.info("test_x.shape", test_x.shape)
+    # logging.info(f"test_x.shape: {test_x.shape}")
     
-    pass
-    
-    timestep = 0
+    timestep = 70
     sample_id = 0
 
     sample = test_x[sample_id]
 
     xt = sample[timestep].unsqueeze(0)
+    # logging.info(f"xt.shape: {xt.shape}")
     z = model.encoder(xt.to(args['device']))
     x_ = model.decoder(z).squeeze(0)
-    logging.info("x_.shape", x_.shape)
 
     f, ax = plt.subplots(1, 2)
     ax[0].imshow(xt.squeeze().detach().cpu(), cmap=sns.cm.icefire)  # shape: H x W
@@ -147,8 +154,8 @@ def evaluate_vae(args):
     ax[1].imshow(x_.squeeze().detach().cpu(), cmap=sns.cm.icefire)
     ax[1].set_title("Reconstruction")
     plt.tight_layout()
-    plt.savefig('./logs/sample_and_x_.png')
-    logging.info("Saved reconstruction figure to ./logs/sample_and_x_.png")
+    plt.savefig(f'{args["log_dir"]}/sample_and_x_.png')
+    logging.info(f"Saved reconstruction figure to {args['log_dir']}/sample_and_x_.png")
 
 
 

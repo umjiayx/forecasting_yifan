@@ -37,6 +37,8 @@ class Config:
         self.dataset = args.dataset
 
         self.debug = args.debug
+        
+        logging.info("\n\n********* MODE *********\n\n")
         logging.info(f"DEBUG MODE: {self.debug}")
         
         # interpolant + sampling
@@ -102,11 +104,12 @@ class Config:
         logging.info(f"OVERFIT MODE: {self.overfit}")
 
         if self.debug:
-            self.EM_sample_steps = args.EM_sample_steps
+            self.EM_sample_steps = 10
             self.sample_every = 10
             self.print_loss_every = 10
             self.save_every = 10000000
         else:
+            self.EM_sample_steps = args.EM_sample_steps
             self.sample_every = args.sample_every
             self.print_loss_every = args.print_loss_every # 1000
             self.save_every = args.save_every
@@ -122,7 +125,10 @@ class Config:
         self.max_grad_norm = 1.0
         self.base_lr = args.base_lr # (IV. training & sampling)
         self.max_steps = args.max_steps # 1_000_000 # TODO: change back
-        
+        self.val_ratio = args.val_ratio
+        self.validate_every = args.validate_every
+        self.ckpt_dir = args.ckpt_dir
+
         # arch (III. model)
         self.unet_use_classes = True if self.dataset == 'cifar' else False
         self.unet_channels = args.unet_channels
@@ -214,7 +220,6 @@ def setup_wandb(config):
             setattr(wandb.config, key, item)
     print("finished wandb setup")
 
-
 class DriftModel(nn.Module):
     def __init__(self, config):
         
@@ -282,10 +287,8 @@ def flatten_time(lo, hi, hi_size):
 def loader_from_tensor(lo, hi, batch_size, shuffle):
     return DataLoader(TensorDataset(lo, hi), batch_size = batch_size, shuffle = shuffle)
 
-
 def compute_avg_pixel_norm(data_raw):
     return torch.sqrt(torch.mean(data_raw ** 2))
-
 
 def get_forecasting_dataloader_nse(config, shuffle = False):
     data_raw, time_raw = torch.load(config.data_fname)
@@ -345,9 +348,19 @@ def get_forecasting_dataloader_nse(config, shuffle = False):
     logging.info("\n")
 
     # now they are image shaped. Be sure to shuffle to de-correlate neighboring samples when training. 
-    loader = loader_from_tensor(lo, hi, config.batch_size, shuffle = shuffle)
-    return loader, avg_pixel_norm, new_avg_pixel_norm
+    # loader = loader_from_tensor(lo, hi, config.batch_size, shuffle = shuffle)
 
+    dataset = TensorDataset(lo, hi)
+
+    # split into train and val according to config.val_ratio
+    N = len(dataset)
+    val_size = int(N * config.val_ratio)
+    train_size = N - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)   
+
+    return train_loader, val_loader, avg_pixel_norm, new_avg_pixel_norm
 
 def get_forecasting_dataloader_qg(config, shuffle = False):
     data_raw = torch.load(config.data_fname)
@@ -400,14 +413,24 @@ def get_forecasting_dataloader_qg(config, shuffle = False):
     logging.info("\n")
 
     # now they are image shaped. Be sure to shuffle to de-correlate neighboring samples when training. 
-    loader = loader_from_tensor(lo, hi, config.batch_size, shuffle = shuffle)
-    return loader, avg_pixel_norm, new_avg_pixel_norm
+    # loader = loader_from_tensor(lo, hi, config.batch_size, shuffle = shuffle)
 
+    dataset = TensorDataset(lo, hi)
+
+    # split into train and val according to config.val_ratio
+    N = len(dataset)
+    val_size = int(N * config.val_ratio)
+    train_size = N - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)   
+    
+    return train_loader, val_loader, avg_pixel_norm, new_avg_pixel_norm
 
 def make_one_redblue_plot(x, fname):
     plt.ioff()
     fig = plt.figure(figsize=(3,3))
-    plt.imshow(x, cmap=sns.cm.icefire, vmin=-2, vmax=2.)
+    plt.imshow(x.T, cmap=sns.cm.icefire, vmin=-2, vmax=2.)
     plt.axis('off')
     plt.savefig(fname, bbox_inches = 'tight')
     plt.close("all")         
@@ -418,10 +441,13 @@ def open_redblue_plot_as_tensor(fname):
 def make_redblue_plots(x, config):
     plt.ioff()
     x = x.cpu()
-    bsz = x.size()[0]
+    bsz = x.size()[0] # 1
+    # logging.info(f"bsz: {bsz}")
     for i in range(bsz):
         make_one_redblue_plot(x[i,0,...], fname = config.home + f'tmp{i}.jpg')
-    tensor_img = T.ToTensor()(Image.open(config.home + f'tmp1.jpg'))
+    tensor_img = T.ToTensor()(Image.open(config.home + f'tmp0.jpg'))
+    # tensor_img = T.ToTensor()(Image.open(config.home + f'tmp1.jpg'))
+
     C, H, W = tensor_img.size()
     out = torch.zeros((bsz,C,H,W))
     for i in range(bsz):

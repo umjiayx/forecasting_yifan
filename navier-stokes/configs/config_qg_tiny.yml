@@ -1,7 +1,7 @@
 # Command line arguments
-dataset: nse
-debug: true
-overfit: true
+dataset: 'qg'
+debug: false
+overfit: false
 sigma_coef: 1.0
 beta_fn: t^2
 
@@ -12,8 +12,8 @@ sample_only: false
 
 # Datasets
 home: './tmp_images/'
-data_fname: 'nse_data_tiny.pt'
-lo_size: 64
+data_fname: '/scratch/qingqu_root/qingqu/jiayx/QG/qg_tiny.pt'
+lo_size: 128
 hi_size: 128
 time_lag: 2
 subsampling_ratio: 1
@@ -31,13 +31,13 @@ validate_every: 10
 
 # Logging
 sample_every: 100
-print_loss_every: 50
-save_every: 50
-ckpt_dir: './ckpts_nse'
+print_loss_every: 10
+save_every: 100
+ckpt_dir: './ckpts_qg_tiny'
 
 # Other
 num_workers: 4
-wandb_project: 'nse'
+wandb_project: 'qg'
 wandb_entity: 'jiayx'
 
 # Model

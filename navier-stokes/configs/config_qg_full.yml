@@ -26,11 +26,14 @@ max_steps: 100000
 base_lr: 0.0002
 sampling_batch_size: 1
 EM_sample_steps: 500
+val_ratio: 0.05
+validate_every: 20
 
 # Logging
 sample_every: 100
-print_loss_every: 50
-save_every: 50
+print_loss_every: 10
+save_every: 100
+ckpt_dir: './ckpts_qg_full'
 
 # Other
 num_workers: 4
