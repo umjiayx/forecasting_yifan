@@ -15,12 +15,11 @@ import math
 import argparse
 from datetime import datetime
 import logging
-
-import shutil
 import yaml # jiayx
 from types import SimpleNamespace # jiayx
 
-# local
+from interpolant import Interpolant
+
 from utils import (
     is_type_for_logging, 
     to_grid, 
@@ -33,48 +32,11 @@ from utils import (
     setup_wandb, 
     DriftModel, 
     bad,
+    Config,
+    setup_logger,
 )
-from interpolant import Interpolant
-
-from utils import Config
 
 
-def setup_logger(save_dir=None, log_level=logging.INFO, config_path=None):
-    # Create top-level log directory
-    if save_dir is None:
-        save_dir = "./logs"
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Create timestamped subfolder
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(save_dir, timestamp)
-    os.makedirs(run_dir, exist_ok=True)
-
-    # Setup log file path
-    log_path = os.path.join(run_dir, "log.txt")
-
-    # Configure logging
-    logging.basicConfig(
-        level=log_level,
-        format="[%(asctime)s] [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_path),
-            logging.StreamHandler()
-        ]
-    )
-
-    logging.info(f"Logging to {log_path}")
-
-    # Save config file if provided
-    if config_path is not None:
-        try:
-            config_save_path = os.path.join(run_dir, "config.yml")
-            shutil.copy(config_path, config_save_path)
-            logging.info(f"Saved config file to {config_save_path}")
-        except Exception as e:
-            logging.error(f"Failed to save config file: {e}")
-
-    return run_dir  # you can return the folder path for saving models/checkpoints etc.
 
 class Trainer:
 
@@ -176,14 +138,26 @@ class Trainer:
         zt = D['zt']
         at, bt, adot, bdot, bF = D['at'], D['bt'], D['adot'], D['bdot'], D['bF']
         st, sdot = D['st'], D['sdot']
-        numer = (-bt * bF) + (adot * bt * z0) + (bdot * zt) - (bdot * at * z0)
-        denom = (sdot * bt - bdot * st) * st * self.wide(D['t'])
+        numer = (-bt * bF) + (adot * bt * z0) + (bdot * zt) - (bdot * at * z0) # Eq (11) in the paper
+        denom = (sdot * bt - bdot * st) * st * self.wide(D['t']) # Eq (11) in the paper
         assert not bad(numer)
         assert not bad(denom)
-        return numer / denom
+        return numer / denom # Eq (10) in the paper
 
     @torch.no_grad()
-    def EM(self, base = None, label= None, cond = None, diffusion_fn = None):
+    def EM(self, base=None, label=None, cond=None, diffusion_fn=None):
+        '''
+        Perform the Euler-Maruyama algorithm to sample from the model.
+
+        Args:
+            base (torch.Tensor): The base distribution, shape: (B, C, H, W).
+            label (torch.Tensor): The label, shape: ???
+            cond (torch.Tensor): The condition, shape: (B, C, H, W).
+            diffusion_fn (callable): The diffusion function.
+
+        Returns:
+            torch.Tensor: The sample estimate from target distribution.
+        '''
         c = self.config
         steps = c.EM_sample_steps
         tmin, tmax = c.t_min_sampling, c.t_max_sampling
@@ -201,12 +175,13 @@ class Trainer:
         def step_fn(xt, t, label):
             D = self.I.interpolant_coefs({'t': t, 'zt': xt, 'z0': base})
 
-            bF = self.model(xt, t, label, cond = cond)
+            bF = self.model(xt, t, label, cond=cond)
             D['bF'] = bF
             sigma = self.I.sigma(t)
            
             # specified diffusion func
             if diffusion_fn is not None:
+                # Eq (8) in the paper
                 g = diffusion_fn(t)
                 s = self.drift_to_score(D)
                 f = bF + .5 *  (g.pow(2) - sigma.pow(2)) * s
@@ -230,8 +205,9 @@ class Trainer:
                 tscalar = ts[1] # 0 + (1/500)
 
             if (i+1) % 100 == 0:
-                logging.info("100 sample steps")
-            xt, mu = step_fn(xt, tscalar * ones, label = label)
+                logging.info(f"Step {i+1} of total {steps} steps...")
+
+            xt, mu = step_fn(xt, tscalar*ones, label = label)
         assert not bad(mu)
         return mu
 
@@ -246,7 +222,11 @@ class Trainer:
         
         D = self.prepare_batch(batch = None, for_sampling = True)
 
-        EM_args = {'base': D['z0'], 'label': D['label'], 'cond': D['cond']}
+        EM_args = {
+            'base': D['z0'], 
+            'label': D['label'], 
+            'cond': D['cond']
+            }
        
         # list diffusion funcs
         # None means use the one you trained with
@@ -279,7 +259,7 @@ class Trainer:
         for k in diffusion_fns.keys():
            
             logging.info(f'sampling for diffusion function: {k}')
-            sample = self.EM(diffusion_fn=diffusion_fns[k], **EM_args)
+            sample = self.EM(diffusion_fn=diffusion_fns[k], **EM_args) 
 
             sample = preprocess_fn(sample)
 
@@ -288,8 +268,8 @@ class Trainer:
             plotD[k + "(cond, sample, real)"] = wandb.Image(all_tensors)
 
 
-        if self.config.use_wandb:
-            wandb.log(plotD, step = self.step)
+        assert self.config.use_wandb, "wandb must be supported for sampling"
+        wandb.log(plotD, step = self.step)
 
     @torch.no_grad()
     def maybe_sample(self,):
@@ -441,39 +421,6 @@ class Trainer:
         self.definitely_sample()
         logging.info("DONE")
 
-    def do_step_old(self, batch_idx, batch):
-
-        D = self.prepare_batch(batch)
-        self.model.train()
-        loss = self.training_step(D)
-        loss.backward()
-        self.train_loss_history.append(loss.item())
-        grad_norm = self.optimizer_step() # updates self.step 
-        self.maybe_sample()
-
-        if self.step % self.config.print_loss_every == 0:
-            logging.info(f"[Training] Step {self.step} | Training loss: {loss.item():.2f}")
-            if self.config.use_wandb:
-                wandb.log({'training_loss': loss.item(), 'grad_norm': grad_norm}, step = self.step)
-
-        if self.step % self.config.save_every == 0:
-            logging.info(f"saving at step {self.step}!")
-            self.save_ckpt(best_model = False)
-
-        if self.step % self.config.validate_every == 0:
-            val_loss = self.run_validation()
-            self.val_loss_history.append(val_loss)
-            if val_loss < self.best_val_loss:
-                logging.info(f"*** saving best model! Val loss improved to {val_loss:.4f} at step {self.step}. ***")
-                self.save_ckpt(best_model=True)
-                self.best_val_loss = val_loss
-        
-        self.step += 1
-
-        # save the training and validation loss history to the log folder as a npy file
-        np.save(f"{self.config.log_dir}/train_loss_history.npy", np.array(self.train_loss_history))
-        np.save(f"{self.config.log_dir}/val_loss_history.npy", np.array(self.val_loss_history))
-
     def do_step(self, batch_idx, batch):
         # Prepare batch and compute training loss
         D = self.prepare_batch(batch)
@@ -543,7 +490,6 @@ class Trainer:
 def main():
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='config.yml')

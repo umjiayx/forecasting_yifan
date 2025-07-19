@@ -150,6 +150,15 @@ def bad(x):
     return torch.any(torch.isnan(x)) or torch.any(torch.isinf(x))                                                                                        
 
 def is_type_for_logging(x):
+    '''
+    Check if a variable is of a type that can be logged to wandb.
+
+    Args:
+        x (any): The variable to check.
+
+    Returns:
+        bool: True if the variable is of a type that can be logged to wandb, False otherwise.
+    '''
     if isinstance(x, int):
         return True
     elif isinstance(x, float):
@@ -168,7 +177,8 @@ def is_type_for_logging(x):
 ## if you want to make a grid of images
 def to_grid(x, grid_kwargs):
     nrow = int(np.floor(np.sqrt(x.shape[0])))
-    return make_grid(x, nrow = nrow, **grid_kwargs)
+    return make_grid(x, nrow = nrow, **grid_kwargs) 
+    # torchvision.utils.make_grid returns a tensor containing a grid of images
 
 def clip_grad_norm(model, max_norm):
     return torch.nn.utils.clip_grad_norm_(
@@ -244,11 +254,9 @@ class DriftModel(nn.Module):
         logging.info("\n\n********* NETWORK *********\n\n")
         logging.info(f"Num params in main arch for drift is {num_params:,}")
 
-    def forward(self, zt, t, y, cond=None):
-        
+    def forward(self, zt, t, y, cond=None):        
         if not self.config.unet_use_classes:
             y = None
-
 
         if cond is not None:
             zt = torch.cat([zt, cond], dim = 1)
@@ -428,6 +436,16 @@ def get_forecasting_dataloader_qg(config, shuffle = False):
     return train_loader, val_loader, avg_pixel_norm, new_avg_pixel_norm
 
 def make_one_redblue_plot(x, fname):
+    """
+    Make a single redblue plot from a tensor of images.
+
+    Args:
+        x (torch.Tensor): A tensor of images, shape: (H, W), C=1. 
+        fname (str): A string, the path to the file to save the plot.
+
+    Returns:
+        None
+    """
     plt.ioff()
     fig = plt.figure(figsize=(3,3))
     plt.imshow(x.T, cmap=sns.cm.icefire, vmin=-2, vmax=2.)
@@ -439,6 +457,18 @@ def open_redblue_plot_as_tensor(fname):
     return T.ToTensor()(Image.open(fname))
 
 def make_redblue_plots(x, config):
+    # write a docstring for this function
+    """
+    Make a grid of redblue plots from a tensor of images.
+
+    Args:
+        x (torch.Tensor): A tensor of images, shape: (bsz, C, H, W), C=1. 
+        config (Config): A Config object.
+            - config.home: a string, the path to the home directory.
+
+    Returns:
+        out (torch.Tensor): A tensor of redblue plots.
+    """
     plt.ioff()
     x = x.cpu()
     bsz = x.size()[0] # 1
@@ -454,6 +484,42 @@ def make_redblue_plots(x, config):
         out[i,...] = open_redblue_plot_as_tensor(config.home + f'tmp{i}.jpg')
     return out
 
+def setup_logger(save_dir=None, log_level=logging.INFO, config_path=None):
+    # Create top-level log directory
+    if save_dir is None:
+        save_dir = "./logs"
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Create timestamped subfolder
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(save_dir, timestamp)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Setup log file path
+    log_path = os.path.join(run_dir, "log.txt")
+
+    # Configure logging
+    logging.basicConfig(
+        level=log_level,
+        format="[%(asctime)s] [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler()
+        ]
+    )
+
+    logging.info(f"Logging to {log_path}")
+
+    # Save config file if provided
+    if config_path is not None:
+        try:
+            config_save_path = os.path.join(run_dir, "config.yml")
+            shutil.copy(config_path, config_save_path)
+            logging.info(f"Saved config file to {config_save_path}")
+        except Exception as e:
+            logging.error(f"Failed to save config file: {e}")
+
+    return run_dir  # you can return the folder path for saving models/checkpoints etc.
 
 
 
