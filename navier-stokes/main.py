@@ -28,6 +28,7 @@ from utils import (
     get_cifar_dataloader, 
     get_forecasting_dataloader_nse,
     get_forecasting_dataloader_qg,
+    get_forecasting_dataloader_qg_sampling,
     make_redblue_plots,
     setup_wandb, 
     DriftModel, 
@@ -36,51 +37,67 @@ from utils import (
     setup_logger,
 )
 
+from measurements import get_operator, get_noiser
+
 
 
 class Trainer:
 
-    def __init__(self, config, load_path = None, sample_only = False, use_wandb = True):
+    def __init__(self, config):
 
         self.config = config
         c = config
 
-        if sample_only:
-            assert load_path is not None
+        # Logging
+        setup_wandb(c)
+        
+        self.sample_only = c.sample_only
+        self.load_path = None
+        self.device = c.device
 
-        self.sample_only = sample_only
+        if self.sample_only:
+            assert c.load_path is not None, "load_path must be provided for sampling"
+            self.load_path = c.load_path
 
-        c.use_wandb = use_wandb
+            # Measurements
+            self.operator = get_operator(c)
+            self.noiser = get_noiser(c)
 
+            # Auto-regressive steps
+            self.auto_step = c.auto_step
+
+
+        # Stochastic Interpolants
         self.I = Interpolant(c)
 
-        self.load_path = load_path
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        if c.dataset == 'cifar':
-            self.train_loader = get_cifar_dataloader(c)
 
-        elif c.dataset == 'nse':
-            self.train_loader, self.val_loader, old_pixel_norm, new_pixel_norm = get_forecasting_dataloader_nse(c)
-            c.old_pixel_norm = old_pixel_norm
-            c.new_pixel_norm = new_pixel_norm
-            # NOTE: if doing anything with the samples other than wandb plotting,
-            # e.g. if computing metrics like spectra
-            # must scale the output by old_pixel_norm to put it back into data space
-            # we model the data divided by old_pixel_norm
-        
-        elif c.dataset == 'qg':
-            self.train_loader, self.val_loader, old_pixel_norm, new_pixel_norm = get_forecasting_dataloader_qg(c)
-            c.old_pixel_norm = old_pixel_norm
-            c.new_pixel_norm = new_pixel_norm
-
+        # Datasets
+        if c.sample_only:
+            self.test_loader, avg_pixel_norm = get_forecasting_dataloader_qg_sampling(c)
+            self.test_batch = next(iter(self.test_loader))
         else:
-            assert False, "dataset must be 'cifar', 'nse', or 'qg'"
+            if c.dataset == 'cifar':
+                self.train_loader = get_cifar_dataloader(c)
+            elif c.dataset == 'nse':
+                self.train_loader, self.val_loader, old_pixel_norm, new_pixel_norm=get_forecasting_dataloader_nse(c)
+                c.old_pixel_norm = old_pixel_norm
+                c.new_pixel_norm = new_pixel_norm
+                # NOTE: if doing anything with the samples other than wandb plotting,
+                # e.g. if computing metrics like spectra
+                # must scale the output by old_pixel_norm to put it back into data space
+                # we model the data divided by old_pixel_norm
+            elif 'qg' in c.dataset:
+                self.train_loader, self.val_loader, old_pixel_norm, new_pixel_norm=get_forecasting_dataloader_qg(c)
+                c.old_pixel_norm = old_pixel_norm
+                c.new_pixel_norm = new_pixel_norm
+            else:
+                assert False, "dataset must be 'cifar', 'nse', or 'qg'"
 
-        self.overfit_batch = next(iter(self.train_loader))
+            self.overfit_batch = next(iter(self.train_loader))
 
+
+        # Model & Optimizer
         self.model = DriftModel(c)
-
         self.model.to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=c.base_lr)
         self.step = 0
@@ -94,11 +111,13 @@ class Trainer:
             self.load()
 
         self.U = torch.distributions.Uniform(low=c.t_min_train, high=c.t_max_train)
-        setup_wandb(c)
-        
-        self.print_config()  # TODO: uncomment this
 
-    def save_ckpt(self, best_model = False):
+        # FlowDAS
+        self.MC_times = c.MC_times
+
+        # self.print_config() 
+
+    def save_ckpt(self, best_model=False):
         D = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -144,6 +163,9 @@ class Trainer:
         assert not bad(denom)
         return numer / denom # Eq (10) in the paper
 
+    def compute_nrmse(self, z1, sample):
+        return torch.linalg.norm(z1 - sample) / torch.linalg.norm(z1)
+
     @torch.no_grad()
     def EM(self, base=None, label=None, cond=None, diffusion_fn=None):
         '''
@@ -173,12 +195,16 @@ class Trainer:
         # the correct drift coefficient
 
         def step_fn(xt, t, label):
+            logging.info(f'xt.shape: {xt.shape}')
+            logging.info(f't.shape: {t.shape}')
+
+            # assert False, "Stop here"
             D = self.I.interpolant_coefs({'t': t, 'zt': xt, 'z0': base})
 
             bF = self.model(xt, t, label, cond=cond)
             D['bF'] = bF
             sigma = self.I.sigma(t)
-           
+
             # specified diffusion func
             if diffusion_fn is not None:
                 # Eq (8) in the paper
@@ -211,10 +237,155 @@ class Trainer:
         assert not bad(mu)
         return mu
 
+    def taylor_est_x1(self, xt, t, bF, g, use_original_sigma = True, analytical = True):
+        if use_original_sigma == True and analytical == False:
+            hat_x1 = xt + bF * (1-t) + g * torch.randn_like(xt) * (1-t).sqrt()
+        elif use_original_sigma == True and analytical == True:
+            hat_x1 = xt + bF * (1-t) + torch.randn_like(xt) * (2/3 - t.sqrt()+(1/3) * (t.sqrt())**3)
+        return hat_x1.requires_grad_(True)
+
+    def taylor_est2rd_x1(self, xt, t, bF, g, label, cond,use_original_sigma = True, analytical = True):
+        '''
+        xt: (B, C=1, H, W)
+        t: (B,)
+        bF: (B, C=1, H, W)
+        g: (B, 1, 1, 1)
+        cond: (B, C=1, H, W)
+        '''
+        MC_times = self.MC_times
+        
+        if use_original_sigma == True and analytical == False:
+            hat_x1 = xt + bF * (1-t) + g * torch.randn_like(xt) * (1-t).sqrt()
+        elif use_original_sigma == True and analytical == True and MC_times == 1:
+            hat_x1 = xt + bF * (1-t) + torch.randn_like(xt) * (2/3 - t.sqrt()+(1/3) * (t.sqrt())**3)
+            t1 = torch.FloatTensor([1])
+            bF2 = self.model(hat_x1,t1.to(hat_x1.device),label,cond=cond).requires_grad_(True)
+            hat_x1 =  xt + (bF + bF2)/2 * (1-t) + torch.randn_like(xt) * (2/3 - t.sqrt()+(1/3) * (t.sqrt())**3)
+            return hat_x1.requires_grad_(True)
+        elif use_original_sigma == True and analytical == True and MC_times != 1:
+            hat_x1 = xt + bF * (1-t) + torch.randn_like(xt) * (2/3 - t.sqrt()+(1/3) * (t.sqrt())**3)
+            t1 = torch.FloatTensor([1])
+            bF2 = self.model(hat_x1,t1.to(hat_x1.device),label,cond=cond).requires_grad_(True)
+            hat_x1_list = []
+            for i in range(MC_times):
+                hat_x1 =  xt + (bF + bF2)/2 * (1-t) + torch.randn_like(xt) * (2/3 - t.sqrt()+(1/3) * (t.sqrt())**3)
+                hat_x1_list.append(hat_x1.requires_grad_(True))
+            return hat_x1_list
+
+    def grad_and_value(self, x_prev, x_0_hat, measurement, **kwargs):
+            # print('if require grad',x_prev.requires_grad,x_0_hat.requires_grad)
+        if isinstance(x_0_hat, torch.Tensor):
+            assert 1==0
+            difference = (measurement - self.noiser(self.operator(x_0_hat))).requires_grad_(True)
+            norm = torch.linalg.norm(difference).requires_grad_(True)
+            print('diff',norm)
+            norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev, allow_unused=True)[0]
+        else:
+            difference = 0
+            for i in range(len(x_0_hat)):
+                difference +=(measurement - self.operator(x_0_hat[i])).requires_grad_(True)
+            difference = difference/len(x_0_hat)
+            # print('difference',difference)
+            norm = torch.linalg.norm(difference).requires_grad_(True)
+            # logging.info(f'difference norm: {norm}')
+            norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev, allow_unused=True)[0]
+        return norm_grad, norm
+    
+    # @torch.no_grad(), we need to compute the grad like DPS.
+    def EM_flowdas(self, measurement=None,base=None, label=None, cond=None, diffusion_fn=None):
+        '''
+        Perform the Euler-Maruyama+DPS (flowdas) algorithm to sample from the model.
+        '''
+        c = self.config
+        steps = c.EM_sample_steps
+        tmin, tmax = c.t_min_sampling, c.t_max_sampling
+        ts = torch.linspace(tmin, tmax, steps)
+        dt = ts[1] - ts[0]
+        ones = torch.ones(base.shape[0])
+
+        # initial condition
+        # logging.info(f'base.shape: {base.shape}')
+        # logging.info(f'measurement.shape: {measurement.shape}')
+        # logging.info(f'cond.shape: {cond.shape}')
+
+        xt = base.requires_grad_(True)
+
+        def step_fn(xt, t, label, measurement):
+            '''
+            xt: (B, C=1, H, W)
+            t: (B,)
+            measurement: (B, C, H, W)
+            '''
+            #logging.info(f'xt.shape: {xt.shape}')
+            #logging.info(f't.shape: {t.shape}')
+            #logging.info(f'measurement.shape: {measurement.shape}')
+            
+            D = self.I.interpolant_coefs({'t': t, 'zt': xt, 'z0': base})
+
+            t = t.numpy()
+            t = torch.FloatTensor(t)
+            t = t.to(xt.device)
+
+            bF = self.model(xt, t, label, cond=cond)
+            D['bF'] = bF
+            sigma = self.I.sigma(t)
+
+            #logging.info(f'bF.requires_grad: {bF.requires_grad}') # False
+            #logging.info(f'xt.requires_grad: {xt.requires_grad}') # True
+            
+            if diffusion_fn is not None:
+                g = diffusion_fn(t)
+                s = self.drift_to_score(D)
+                f = bF + .5 *  (g.pow(2) - sigma.pow(2)) * s
+            else:
+                f = bF
+                g = sigma
+            
+            scale = 1
+
+            #logging.info(f'bF.shape: {bF.shape}') # (B, C=1, H, W)
+            #logging.info(f'sigma.shape: {sigma.shape}') # (B, 1, 1, 1)
+            #logging.info(f't.shape: {t.shape}') # (B,)
+
+            
+            es_x1 = self.taylor_est2rd_x1(xt, t, bF, g, label, cond)
+            norm_grad, norm = self.grad_and_value(xt, es_x1, measurement)
+            
+            # assert False, "Stop here"
+            
+            mu = xt + f*dt
+
+            if norm_grad is None:
+                norm_grad = 0
+                logging.info(f'No grad!')
+
+            xt = mu + g*torch.randn_like(mu)*dt.sqrt() - scale*norm_grad
+
+            # xt = xt.detach().clone().requires_grad_(True) # TODO: ????
+
+            return xt, mu
+
+
+
+        for i, tscalar in enumerate(ts):
+            if i == 0 and (diffusion_fn is not None):
+                tscalar = ts[1]
+            
+            if (i+1) % 100 == 0:
+                logging.info(f"EM step {i+1} of total {steps} steps...")
+            xt, mu = step_fn(xt, tscalar*ones, label=label, measurement=measurement)
+
+        assert not bad(mu)
+        return mu
+
     @torch.no_grad()
     def definitely_sample(self,):
-      
+        '''
+        1. Training Phase: sampling during validation steps
+        2. Inference Phase: pure forecasting for only one time step
+        '''
         c = self.config
+        assert c.auto is False, "Sampling is not supported for auto mode"
 
         logging.info("SAMPLING")
 
@@ -239,19 +410,19 @@ class Trainer:
             preprocess_fn = lambda x : to_grid(x, c.grid_kwargs)
 
         else:
-            assert c.dataset == 'nse' or c.dataset == 'qg'
-            preprocess_fn = lambda x: to_grid(make_redblue_plots(x, c), c.grid_kwargs)
+            assert c.dataset == 'nse' or 'qg' in c.dataset
+            preprocess_fn = lambda x, name: to_grid(make_redblue_plots(x, c, name), c.grid_kwargs)
 
         logging.info(f"D['z1'].shape: {D['z1'].shape}") # (4, 1, 128, 128)
         logging.info(f"D['z0'].shape: {D['z0'].shape}") # (4, 1, 128, 128)
 
-        z1 = preprocess_fn(D['z1'])
-        z0 = preprocess_fn(D['z0'])
+        z1_plot = preprocess_fn(D['z1'], name='z1') # (3, 508, 506)
+        z0_plot = preprocess_fn(D['z0'], name='z0') # (3, 508, 506)
 
-        logging.info(f"z1.shape: {z1.shape}") # (3, 508, 506)
-        logging.info(f"z0.shape: {z0.shape}") # (3, 508, 506)
+        logging.info(f"z1_plot.shape: {z1_plot.shape}") # (3, 508, 506)
+        logging.info(f"z0_plot.shape: {z0_plot.shape}") # (3, 508, 506)
 
-        cond = preprocess_fn(D['cond'])
+        cond_plot = preprocess_fn(D['cond'], name='cond')
 
         plotD = {}
 
@@ -261,9 +432,11 @@ class Trainer:
             logging.info(f'sampling for diffusion function: {k}')
             sample = self.EM(diffusion_fn=diffusion_fns[k], **EM_args) 
 
-            sample = preprocess_fn(sample)
+            sample_plot = preprocess_fn(sample, name='sample')
 
-            all_tensors = torch.cat([z0, sample, z1], dim=-1) 
+            all_tensors = torch.cat([z0_plot, sample_plot, z1_plot], dim=-1) 
+
+            logging.info(f"all_tensors.shape: {all_tensors.shape}")
             
             plotD[k + "(cond, sample, real)"] = wandb.Image(all_tensors)
 
@@ -271,6 +444,156 @@ class Trainer:
         assert self.config.use_wandb, "wandb must be supported for sampling"
         wandb.log(plotD, step = self.step)
 
+    # @torch.no_grad() This is not good!!!! Ahhhhhhh...
+    def autoregressive_sample(self,):
+        c = self.config
+        assert c.sample_only and c.auto, "Autoregressive sampling is only supported when both sampling only mode and auto mode are enabled"
+
+        logging.info(f"*** AUTOREGRESSIVE SAMPLING! ***")
+        self.model.eval()
+
+        assert c.sampling_batch_size == 1, "Sampling batch size must be 1 for autoregressive sampling, will change this later"
+        
+        batch = self.test_batch
+
+        D = self.prepare_batch_autoregressive(batch=batch)
+
+        logging.info(f"D['z0'].shape: {D['z0'].shape}") # (auto_step, C, H, W)
+
+        EM_args = {
+            'base': D['z0'],  # (auto_step, C, H, W)
+            'label': D['label'], 
+            'cond': D['cond']
+            }
+        
+        diffusion_fns = {
+            'g_sigma': None,
+            # 'g_other': lambda t: c.sigma_coef * self.wide(1-t).pow(4),
+        }
+
+        measurements = self.operator(D['z1']) # (B=auto_step, C, H, W)
+        measurements = self.noiser(measurements)
+
+        # logging.info(f"D['z0'].shape: {D['z0'].shape}") # (B, C=1, H, W)  
+        # logging.info(f"D['z1'].shape: {D['z1'].shape}")
+        # logging.info(f"measurements.shape: {measurements.shape}")
+
+        if c.dataset == 'cifar':
+            preprocess_fn = lambda x : to_grid(x, c.grid_kwargs)
+        else:
+            assert c.dataset == 'nse' or 'qg' in c.dataset
+            preprocess_fn = lambda x, name: to_grid(make_redblue_plots(x, c, name), c.grid_kwargs)
+
+        sample = None
+        all_samples = []
+        all_tensors = []
+        plotD = {}
+        nrmse_list = []
+
+        for step in range(c.auto_step):
+            logging.info(f"********** Time step {step+1} of total {c.auto_step} steps... **********")
+            
+            if step >= 1:
+                assert sample is not None, "sample is not initialized"
+                assert step > 0, "autoregressive step should be greater than 0"
+                # autoregressive step
+                cond = sample # (B, C, H, W)
+                z0 = cond # (B, C, H, W)
+            else:
+                assert sample is None, "initial step should not have sample yet"
+                assert step == 0, "initial step should be 0"
+                cond = D['cond'][step].unsqueeze(0) # (1, C, H, W)
+                z0 = D['z0'][step].unsqueeze(0) # (1, C, H, W)
+            
+            # generate sample:
+            sample = self.EM_flowdas(diffusion_fn=diffusion_fns['g_sigma'], 
+                             measurement=measurements[step].unsqueeze(0),
+                             base=z0,
+                             cond=cond) # (B, C, H, W)
+            all_samples.append(sample.detach().clone())
+
+    
+        # Plot (z1, measurement, sample) for all steps
+        for step in range(c.auto_step):
+            z1 = D['z1'][step].unsqueeze(0) # (1, C, H, W)
+            measurement = measurements[step].unsqueeze(0) # (1, C, H, W)
+            sample = all_samples[step] # (1, C, H, W)
+            error = z1 - sample # (1, C, H, W)
+
+            # logging.info(f"error.max(): {error.square().sqrt().max().item():.4f}")
+
+            nrmse = self.compute_nrmse(z1, sample)
+            nrmse_list.append(nrmse)
+            wandb.log({f"nrmse_step": nrmse}, step=step)
+
+            # logging.info(f"z1.shape: {z1.shape}")
+            # logging.info(f"measurement.shape: {measurement.shape}")
+            # logging.info(f"sample.shape: {sample.shape}")
+
+            z1_plot = preprocess_fn(z1, 'z1') # (3, 251, 250)
+            measurement_plot = preprocess_fn(measurement, 'measurement') # (3, 251, 250)
+            sample_plot = preprocess_fn(sample, 'sample') # (3, 251, 250)
+            error_plot = preprocess_fn(error, 'error') # (3, 251, 250)
+
+            # logging.info(f"z1_plot.shape: {z1_plot.shape}")
+            # logging.info(f"measurement_plot.shape: {measurement_plot.shape}")
+            # logging.info(f"sample_plot.shape: {sample_plot.shape}")
+
+            all_tensors_step = torch.cat([measurement_plot, z1_plot, sample_plot, error_plot], dim=-2) 
+            # logging.info(f"all_tensors_step.shape: {all_tensors_step.shape}")
+
+            all_tensors.append(all_tensors_step)
+        
+
+        if len(all_tensors) > 1:
+            all_tensors = torch.cat(all_tensors, dim=-1)
+        else:
+            all_tensors = all_tensors[0]
+        
+        # logging.info(f"all_tensors.dtype: {all_tensors.dtype}")
+        # logging.info(f"all_tensors.device: {all_tensors.device}")
+        # logging.info(f"all_tensors.shape: {all_tensors.shape}")
+
+        plotD['g_sigma' + "(GT, measurement, FlowDAS)"] = wandb.Image(all_tensors)
+
+        # log the nrmse_list to wandb and see the curve
+        # plotD['nrmse'] = wandb.Image(nrmse_list)
+        
+        assert self.config.use_wandb, "wandb must be supported for sampling"
+        wandb.log(plotD, step=self.step)
+
+        # print all the nrmse in the list
+        for i, nrmse in enumerate(nrmse_list):
+            logging.info(f"nrmse at step {i+1}: {nrmse.item()*100:.4f}%")
+        
+        
+        '''
+        step = 0 # TODO: Remove this
+        z1_plot = preprocess_fn(D['z1'], 'z1')
+        z0_plot = preprocess_fn(D['z0'], 'z0')
+        measurement_plot = preprocess_fn(measurements, 'measurement')     
+
+        sample = self.EM_flowdas(diffusion_fn=diffusion_fns['g_sigma'], 
+                             measurement = measurements[step].unsqueeze(0),
+                             base = D['z0'][step].unsqueeze(0),
+                             cond = D['cond'][step].unsqueeze(0)) 
+        sample = sample.detach().clone()
+
+        plotD = {}
+        sample_plot = preprocess_fn(sample, 'sample')
+
+        all_tensors_step = torch.cat([z0_plot, measurement_plot, sample_plot, z1_plot], dim=-1) 
+        
+        logging.info(f"all_tensors_step.dtype: {all_tensors_step.dtype}")
+        logging.info(f"all_tensors_step.device: {all_tensors_step.device}")
+        logging.info(f"all_tensors_step.shape: {all_tensors_step.shape}")
+        
+        plotD['g_sigma' + "(cond, measurement, sample, real)"] = wandb.Image(all_tensors_step)
+
+        assert self.config.use_wandb, "wandb must be supported for sampling"
+        wandb.log(plotD, step = self.step)
+        '''
+    
     @torch.no_grad()
     def maybe_sample(self,):
         is_time = self.step % self.config.sample_every == 0
@@ -293,13 +616,13 @@ class Trainer:
 
     def training_step(self, D):
         assert self.model.training
-        model_out = self.model(D['zt'], D['t'], D['label'], cond = D['cond'])
+        model_out = self.model(D['zt'], D['t'], D['label'], cond=D['cond'])
         target = D['drift_target']
         return self.image_sq_norm(model_out - target).mean()
     
     def compute_val_loss(self, D):
         assert self.model.eval()
-        model_out = self.model(D['zt'], D['t'], D['label'], cond = D['cond'])
+        model_out = self.model(D['zt'], D['t'], D['label'], cond=D['cond'])
         target = D['drift_target']
         return self.image_sq_norm(model_out - target).mean()
 
@@ -307,7 +630,7 @@ class Trainer:
         return (x * 2.0) - 1.0
 
     @torch.no_grad()
-    def prepare_batch_nse(self, batch = None, for_sampling = False):
+    def prepare_batch_nse(self, batch=None, for_sampling=False):
 
         assert not self.config.center_data
 
@@ -325,12 +648,13 @@ class Trainer:
         return D
     
     @torch.no_grad()
-    def prepare_batch_qg(self, batch = None, for_sampling = False):
+    def prepare_batch_qg(self, batch=None, for_sampling=False):
         assert not self.config.center_data
 
         xlo, xhi = batch
 
         if for_sampling:
+            # When running validation, we do not need this. Needed when sampling only.
             xlo = xlo[:self.config.sampling_batch_size]
             xhi = xhi[:self.config.sampling_batch_size]
 
@@ -342,7 +666,7 @@ class Trainer:
         return D
 
     @torch.no_grad()
-    def prepare_batch_cifar(self, batch = None, for_sampling = False):
+    def prepare_batch_cifar(self, batch=None, for_sampling=False):
 
         x, y = batch
 
@@ -365,20 +689,71 @@ class Trainer:
         return D
 
     @torch.no_grad()
-    def prepare_batch(self, batch = None, for_sampling = False):
-        if batch is None or self.config.overfit:
+    def prepare_batch(self, batch=None, for_sampling=False):
+        if self.config.overfit:
+            assert self.sample_only is False, "Overfit mode is not supported for sampling"
+            assert self.config.auto is False, "Auto mode should not be implemented in this method"
             batch = self.overfit_batch
+        
+        if self.config.sample_only:
+            assert self.config.overfit is False, "Overfit mode is not supported for sampling"
+            assert self.config.auto is False, "Auto mode should not be implemented in this method"
+            batch = self.test_batch
 
         # get (z0, z1, label, N)
         if self.config.dataset == 'cifar':
-            D = self.prepare_batch_cifar(batch, for_sampling = for_sampling) 
+            D = self.prepare_batch_cifar(batch, for_sampling=for_sampling) 
         elif self.config.dataset == 'nse':
-            D = self.prepare_batch_nse(batch, for_sampling = for_sampling)
-        elif self.config.dataset == 'qg':
-            D = self.prepare_batch_qg(batch, for_sampling = for_sampling)
+            D = self.prepare_batch_nse(batch, for_sampling=for_sampling)
+        elif 'qg' in self.config.dataset:
+            D = self.prepare_batch_qg(batch, for_sampling=for_sampling)
         else:
             assert False, "dataset must be 'cifar', 'nse', or 'qg'"
 
+        D = self.update_D(D)
+   
+        return D
+
+    @torch.no_grad()
+    def prepare_batch_autoregressive(self, batch=None):
+        '''
+        batch: (xlo, xhi)
+        xlo.shape: (batch_size, C, H, W)
+        xhi.shape: (batch_size, C, H, W)
+
+        Return:
+        D: {'z0': xlo, 'z1': xhi, 'label': y, 'N': N}
+        D['z0'].shape: (auto_step, C, H, W)
+        D['z1'].shape: (auto_step, C, H, W)
+        '''
+        c = self.config
+        xlo, xhi = batch
+
+        assert c.auto_step < c.batch_size, "Auto step must be less than batch size"
+
+        # generate a random starting index, and make sure the ending index is not out of bounds
+        start_idx = torch.randint(0, c.batch_size - c.auto_step, (1,))
+        end_idx = start_idx + c.auto_step
+
+        xlo = xlo[start_idx:end_idx]
+        xhi = xhi[start_idx:end_idx]
+
+        logging.info(f"Looking at test batch: start_idx: {start_idx}, end_idx: {end_idx} out of batch size {c.batch_size}.")
+
+        xlo, xhi = xlo.to(self.device), xhi.to(self.device)
+        N = xlo.shape[0]
+        y = None
+
+        D = {'z0': xlo, 'z1': xhi, 'label': y, 'N': N}
+
+        D = self.update_D(D)
+
+        return D
+
+    def update_D(self, D):
+        '''
+        Update D when preparing the batch for training or sampling.
+        '''
         # get random batch of times
         D = self.get_time(D)
 
@@ -394,7 +769,7 @@ class Trainer:
         D['zt'] = self.I.compute_zt(D)
         
         D['drift_target'] = self.I.compute_target(D)
-   
+
         return D
 
     @torch.no_grad()
@@ -403,6 +778,7 @@ class Trainer:
         val_losses = []
 
         for batch in self.val_loader:
+            # batch.shape: (batch_size, C, H, W)
             D = self.prepare_batch(batch)
             loss = self.compute_val_loss(D)
             val_losses.append(loss.item())
@@ -416,9 +792,15 @@ class Trainer:
         return avg_val_loss
 
     def sample_ckpt(self,):
-        logging.info("not training. just sampling a checkpoint")
-        assert self.config.use_wandb
+        logging.info(f"Sampling using a checkpoint: {self.load_path}")
+        assert self.config.use_wandb, "wandb must be supported for sampling"
         self.definitely_sample()
+        logging.info("DONE")
+    
+    def sample_ckpt_auto(self,):
+        logging.info(f"Autoregressively sampling using a checkpoint: {self.load_path}")
+        assert self.config.use_wandb, "wandb must be supported for sampling"
+        self.autoregressive_sample()
         logging.info("DONE")
 
     def do_step(self, batch_idx, batch):
@@ -487,9 +869,14 @@ class Trainer:
                 self.do_step(batch_idx, batch)
 
 
+
 def main():
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+
+    # random seed
+    torch.manual_seed(42)
+    np.random.seed(42)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='config.yml')
@@ -506,21 +893,20 @@ def main():
 
     logging.info(f"********* RUNNING at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} using config {parsed_args.config} *********")
 
-    conf = Config(args)
-    conf.log_dir = log_dir
+    config = Config(args)
+    config.log_dir = log_dir
 
-    trainer = Trainer(
-        conf, 
-        load_path = args.load_path, # none trains from scratch 
-        sample_only = bool(args.sample_only), 
-        use_wandb = bool(args.use_wandb)
-    )
+    trainer = Trainer(config)
 
     if bool(args.sample_only):
-        trainer.sample_ckpt()
+        if args.auto:
+            trainer.sample_ckpt_auto()
+        else:
+            trainer.sample_ckpt()
     else:
         trainer.fit()
 
 
 if __name__ == '__main__':
     main()
+

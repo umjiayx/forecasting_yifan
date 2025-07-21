@@ -1,21 +1,15 @@
 # Command line arguments
-dataset: 'qg'
 debug: false
 overfit: false
-sigma_coef: 1.0
-beta_fn: t^2
-
-
-# Optional: override others as well
-use_wandb: false
-load_path: null
 sample_only: false
 auto: false
 
 
-# Datasets
+# Datasets & Checkpoints
+dataset: 'qgv2'
 home: './tmp_images/'
-data_fname: '/scratch/qingqu_root/qingqu/jiayx/FlowDAS/QG/data/qg_v1/qg_full.pt'
+data_fname: '/scratch/qingqu_root/qingqu/jiayx/FlowDAS/QG/data/qg_v2/qg_train.pt'
+load_path: null
 lo_size: 128
 hi_size: 128
 time_lag: 2
@@ -24,27 +18,9 @@ C: 1 # number of dataset channels
 num_classes: 1
 
 
-# Training & sampling
-batch_size: 64
-max_steps: 100000
-base_lr: 0.0002
-sampling_batch_size: 1
-EM_sample_steps: 500
-val_ratio: 0.05
-validate_every: 20
-
-
-# Logging
-sample_every: 100
-print_loss_every: 10
-save_every: 100
-ckpt_dir: './ckpts_qg_full'
-
-
-# Other
-num_workers: 4
-wandb_project: 'qgv1'
-wandb_entity: 'jiayx'
+# FlowDAS
+sigma_coef: 1.0
+beta_fn: t^2
 
 
 # Model
@@ -58,7 +34,36 @@ unet_learned_sinusoidal_cond: true
 unet_random_fourier_features: false
 
 
-# Not Used for Training
+
+# Training & sampling
+batch_size: 64
+max_steps: 100_000
+base_lr: 0.0002
+sampling_batch_size: 1
+EM_sample_steps: 500
+val_ratio: 0.10
+validate_every: 20
+
+
+# Logging
+sample_every: 100
+print_loss_every: 10
+save_every: 100
+ckpt_dir: './ckpts_qg_v2_train'
+
+use_wandb: false
+wandb_project: 'qgv2_training'
+wandb_entity: 'jiayx18-university-of-michigan'
+
+
+
+# Other
+num_workers: 4
+device: 'cuda:0'
+
+
+
+##### Not Used for Training #####
 # Task configs 
 auto_step: 1 # number of autoregressive steps for sampling
 task_name: 'SR' # super resolution or SO for sparse observation
