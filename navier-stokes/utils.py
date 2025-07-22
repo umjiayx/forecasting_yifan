@@ -35,16 +35,15 @@ from unet import Unet
 # create a data structure for the constants
 @dataclass(frozen=True)
 class Constants:
-    QG_V1_AVG_PIXEL_NORM_TRAIN: 0.6351982153248673
-    QG_V1_AVG_PIXEL_NORM_FULL: 0.6352024454011677
+    QG_V1_AVG_PIXEL_NORM_TRAIN = 0.6351982153248673
+    QG_V1_AVG_PIXEL_NORM_FULL = 0.6352024454011677
 
-    QG_V2_AVG_PIXEL_NORM_TRAIN: 1.0793864383430332
-    QG_V2_AVG_PIXEL_NORM_FULL: 1.079314860803363
+    QG_V2_AVG_PIXEL_NORM_TRAIN = 1.0793864383430332
+    QG_V2_AVG_PIXEL_NORM_FULL = 1.079314860803363
 
-    NSE_AVG_PIXEL_NORM: 3.0679163932800293
+    NSE_AVG_PIXEL_NORM = 3.0679163932800293
 
 class Config:
-    
     # def __init__(self, dataset, debug, overfit, sigma_coef, beta_fn):
     def __init__(self, args):
 
@@ -62,6 +61,10 @@ class Config:
         self.t_min_sampling = 0.0  # no min time needed
         self.t_max_sampling = .999
         self.device = torch.device(args.device)
+
+        # data
+        self.s_in = args.s_in
+        self.s_out = args.s_out
 
         # data
         if self.dataset == 'cifar':
@@ -162,6 +165,7 @@ class Config:
         # FlowDAS
         self.MC_times = args.MC_times
         self.auto_step = args.auto_step
+        self.grad_scale = args.grad_scale
 
         # measurements
         self.task_name = args.task_name
@@ -252,6 +256,8 @@ def setup_wandb(config):
         resume = None,
         id = None,
     )
+    # Manually push config values with allow_val_change
+    wandb.config.update(config.__dict__, allow_val_change=True)
 
     config.wandb_run_id = config.wandb_run.id
 
@@ -353,7 +359,7 @@ def get_forecasting_dataloader_nse(config, shuffle = False):
     # avg_pixel_norm = 3.0679163932800293 # avg data norm computed a priori
     avg_pixel_norm = compute_avg_pixel_norm(data_raw)
     data = data_raw/avg_pixel_norm
-    new_avg_pixel_norm = 1.0
+    new_avg_pixel_norm = compute_avg_pixel_norm(data) # 1.0
 
     logging.info("\n\n********* DATA *********\n\n")
 
@@ -493,6 +499,7 @@ def get_forecasting_dataloader_qg_sampling(config):
     # Should use the unseen data for sampling
     data_raw = torch.load(config.data_fname)
     data_raw = data_raw.float()
+    '''
     ans = input("Have you update the avg_pixel_norm for the dataset? (y/n): ")
     if ans == 'y' or ans == '':
         avg_pixel_norm = get_avg_pixel_norm(config)
@@ -500,6 +507,8 @@ def get_forecasting_dataloader_qg_sampling(config):
     else:
         avg_pixel_norm = 1.0
         assert False, "You must update the avg_pixel_norm for the dataset!"
+    '''
+    avg_pixel_norm = get_avg_pixel_norm(config)
     
     data = data_raw/avg_pixel_norm
     
@@ -558,6 +567,89 @@ def get_forecasting_dataloader_qg_sampling(config):
     test_loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=False)
 
     return test_loader, avg_pixel_norm
+
+def extract_patches(inputs, outputs, s_in, s_out):
+    """
+    For each trajectory, extract all valid patches (lo, hi) windows and do not cross trajectory boundaries.
+    Input:
+        inputs: (N, T, C, H, W)
+        outputs: (N, T, C, H, W)
+        s_in: int, the size of the input patch
+        s_out: int, the size of the output patch
+    Output:
+        lo: (M, C*s_in, H, W)
+        hi: (M, C*s_out, H, W)
+    """
+
+    assert inputs.ndim == 5, "inputs must be 5D"
+    assert outputs.ndim == 5, "outputs must be 5D"
+
+    assert inputs.shape == outputs.shape, "inputs and outputs must have the same shape"
+
+    N, T, C, H, W = inputs.shape
+
+    M = 0
+    lo_list, hi_list = [], []
+
+    max_t = T - s_in - s_out + 1 # maximum time index for the start of lo
+    for n in range(N):
+        for t in range(max_t):
+            lo_patch = inputs[n, t:t+s_in] # (s_in, C, H, W)
+            hi_patch = outputs[n, t+s_in:t+s_in+s_out] # (s_out, C, H, W)
+            lo_patch = lo_patch.reshape(-1, H, W) # (s_in*C, H, W)
+            hi_patch = hi_patch.reshape(-1, H, W) # (s_out*C, H, W)
+            lo_list.append(lo_patch)
+            hi_list.append(hi_patch)
+            M += 1
+    
+    lo = torch.stack(lo_list, dim=0) # (M, C*s_in, H, W)
+    hi = torch.stack(hi_list, dim=0) # (M, C*s_out, H, W)
+
+    assert max_t*N == M, "M must be max_t*N"
+
+    return lo, hi
+
+def get_dataloader_C(config):
+    """
+    Get the dataloader for the dataset with C channels, where C is not necessarily 1.
+    Input:
+        data_raw: (N, T, H, W)
+    Output:
+        train_loader: dataloader for training
+            lo: (M, s_in, H, W)
+            hi: (M, s_out, H, W)
+    """
+
+    data_raw = torch.load(config.data_fname)
+    data_raw = data_raw.float()
+    assert data_raw.ndim == 4, "data_raw must be 4D"
+
+    data = data_raw.unsqueeze(2) # (N, T, C=1, H, W) in the case of QG and NSE
+    assert data.ndim == 5, "data must be 5D now"
+
+    N, T, C, H, W = data.shape
+
+    lo, hi = maybe_lag(data, config.time_lag)
+    assert lo.shape[1] == T - config.time_lag, "lo must have N - time_lag trajectories"
+    assert hi.shape[1] == T - config.time_lag, "hi must have N - time_lag trajectories"
+
+    lo, hi = extract_patches(lo, hi, config.s_in, config.s_out)
+
+    dataset = TensorDataset(lo, hi)
+    dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+
+    return dataloader
+
+def get_dataloader_C_latent(config):
+    """
+    Get the dataloader for the dataset with C channels, where C is not necessarily 1.
+    Input:
+        data_raw: (N, T, C, H, W)
+    Output:
+        train_loader: dataloader for training
+            lo: (B, C_in, H, W)
+            hi: (B, C_out, H, W)
+    """
 
 def make_one_redblue_plot(x, fname, vmin=-2, vmax=2):
     """

@@ -19,7 +19,7 @@ import yaml # jiayx
 from types import SimpleNamespace # jiayx
 
 from interpolant import Interpolant
-
+import warnings
 from utils import (
     is_type_for_logging, 
     to_grid, 
@@ -35,6 +35,8 @@ from utils import (
     bad,
     Config,
     setup_logger,
+    get_dataloader_C,
+    get_dataloader_C_latent,
 )
 
 from measurements import get_operator, get_noiser
@@ -44,12 +46,12 @@ from measurements import get_operator, get_noiser
 class Trainer:
 
     def __init__(self, config):
+        warnings.filterwarnings("ignore", message="Failed to load image Python extension")
 
         self.config = config
         c = config
 
-        # Logging
-        setup_wandb(c)
+
         
         self.sample_only = c.sample_only
         self.load_path = None
@@ -88,8 +90,9 @@ class Trainer:
                 # we model the data divided by old_pixel_norm
             elif 'qg' in c.dataset:
                 self.train_loader, self.val_loader, old_pixel_norm, new_pixel_norm=get_forecasting_dataloader_qg(c)
-                c.old_pixel_norm = old_pixel_norm
-                c.new_pixel_norm = new_pixel_norm
+                # self.train_loader = get_dataloader_C(c) # TODO: remove this later!!!
+                c.old_pixel_norm = old_pixel_norm # TODO: uncomment this later!!!
+                c.new_pixel_norm = new_pixel_norm # TODO: uncomment this later!!!
             else:
                 assert False, "dataset must be 'cifar', 'nse', or 'qg'"
 
@@ -114,7 +117,10 @@ class Trainer:
 
         # FlowDAS
         self.MC_times = c.MC_times
-
+        self.avg_nrmse_dict = {}
+        
+        # Logging
+        setup_wandb(c)
         # self.print_config() 
 
     def save_ckpt(self, best_model=False):
@@ -195,8 +201,8 @@ class Trainer:
         # the correct drift coefficient
 
         def step_fn(xt, t, label):
-            logging.info(f'xt.shape: {xt.shape}')
-            logging.info(f't.shape: {t.shape}')
+            # logging.info(f'xt.shape: {xt.shape}')
+            # logging.info(f't.shape: {t.shape}')
 
             # assert False, "Stop here"
             D = self.I.interpolant_coefs({'t': t, 'zt': xt, 'z0': base})
@@ -290,7 +296,7 @@ class Trainer:
             # logging.info(f'difference norm: {norm}')
             norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev, allow_unused=True)[0]
         return norm_grad, norm
-    
+
     # @torch.no_grad(), we need to compute the grad like DPS.
     def EM_flowdas(self, measurement=None,base=None, label=None, cond=None, diffusion_fn=None):
         '''
@@ -298,6 +304,7 @@ class Trainer:
         '''
         c = self.config
         steps = c.EM_sample_steps
+        grad_scale = c.grad_scale
         tmin, tmax = c.t_min_sampling, c.t_max_sampling
         ts = torch.linspace(tmin, tmax, steps)
         dt = ts[1] - ts[0]
@@ -336,13 +343,11 @@ class Trainer:
             if diffusion_fn is not None:
                 g = diffusion_fn(t)
                 s = self.drift_to_score(D)
-                f = bF + .5 *  (g.pow(2) - sigma.pow(2)) * s
+                f = bF + .5 * (g.pow(2) - sigma.pow(2)) * s
             else:
                 f = bF
                 g = sigma
             
-            scale = 1
-
             #logging.info(f'bF.shape: {bF.shape}') # (B, C=1, H, W)
             #logging.info(f'sigma.shape: {sigma.shape}') # (B, 1, 1, 1)
             #logging.info(f't.shape: {t.shape}') # (B,)
@@ -359,13 +364,10 @@ class Trainer:
                 norm_grad = 0
                 logging.info(f'No grad!')
 
-            xt = mu + g*torch.randn_like(mu)*dt.sqrt() - scale*norm_grad
-
-            # xt = xt.detach().clone().requires_grad_(True) # TODO: ????
+            # dps, grad_scale should change according to task!!!
+            xt = mu + g*torch.randn_like(mu)*dt.sqrt() - grad_scale*norm_grad 
 
             return xt, mu
-
-
 
         for i, tscalar in enumerate(ts):
             if i == 0 and (diffusion_fn is not None):
@@ -391,7 +393,7 @@ class Trainer:
 
         self.model.eval()
         
-        D = self.prepare_batch(batch = None, for_sampling = True)
+        D = self.prepare_batch(batch=None, for_sampling=True)
 
         EM_args = {
             'base': D['z0'], 
@@ -413,14 +415,14 @@ class Trainer:
             assert c.dataset == 'nse' or 'qg' in c.dataset
             preprocess_fn = lambda x, name: to_grid(make_redblue_plots(x, c, name), c.grid_kwargs)
 
-        logging.info(f"D['z1'].shape: {D['z1'].shape}") # (4, 1, 128, 128)
-        logging.info(f"D['z0'].shape: {D['z0'].shape}") # (4, 1, 128, 128)
+        # logging.info(f"D['z1'].shape: {D['z1'].shape}") # (4, 1, 128, 128)
+        # logging.info(f"D['z0'].shape: {D['z0'].shape}") # (4, 1, 128, 128)
 
         z1_plot = preprocess_fn(D['z1'], name='z1') # (3, 508, 506)
         z0_plot = preprocess_fn(D['z0'], name='z0') # (3, 508, 506)
 
-        logging.info(f"z1_plot.shape: {z1_plot.shape}") # (3, 508, 506)
-        logging.info(f"z0_plot.shape: {z0_plot.shape}") # (3, 508, 506)
+        # logging.info(f"z1_plot.shape: {z1_plot.shape}") # (3, 508, 506)
+        # logging.info(f"z0_plot.shape: {z0_plot.shape}") # (3, 508, 506)
 
         cond_plot = preprocess_fn(D['cond'], name='cond')
 
@@ -436,7 +438,7 @@ class Trainer:
 
             all_tensors = torch.cat([z0_plot, sample_plot, z1_plot], dim=-1) 
 
-            logging.info(f"all_tensors.shape: {all_tensors.shape}")
+            # logging.info(f"all_tensors.shape: {all_tensors.shape}")
             
             plotD[k + "(cond, sample, real)"] = wandb.Image(all_tensors)
 
@@ -511,7 +513,6 @@ class Trainer:
                              base=z0,
                              cond=cond) # (B, C, H, W)
             all_samples.append(sample.detach().clone())
-
     
         # Plot (z1, measurement, sample) for all steps
         for step in range(c.auto_step):
@@ -565,7 +566,15 @@ class Trainer:
         # print all the nrmse in the list
         for i, nrmse in enumerate(nrmse_list):
             logging.info(f"nrmse at step {i+1}: {nrmse.item()*100:.4f}%")
-        
+
+        avg_nrmse = sum(nrmse_list) / len(nrmse_list)
+        logging.info(f"avg_nrmse: {avg_nrmse.item()*100:.4f}% for grad_scale {c.grad_scale} on task {c.task_name}: {c.SO_ratio}, {c.SR_ratio}")
+
+        # if the grad_scale is not in the dict, add it
+        if c.grad_scale not in self.avg_nrmse_dict:
+            self.avg_nrmse_dict[c.grad_scale] = avg_nrmse.item()
+        else:
+            assert False, "grad_scale already in the dict"
         
         '''
         step = 0 # TODO: Remove this
@@ -699,6 +708,11 @@ class Trainer:
             assert self.config.overfit is False, "Overfit mode is not supported for sampling"
             assert self.config.auto is False, "Auto mode should not be implemented in this method"
             batch = self.test_batch
+        else:
+            assert self.config.auto is False, "Auto mode should not be implemented in this method"
+            if batch is None:
+                logging.info(f"Using val loader for sampling, for logging purposes every {self.config.sample_every} steps...")
+                batch = next(iter(self.val_loader))
 
         # get (z0, z1, label, N)
         if self.config.dataset == 'cifar':
@@ -732,8 +746,11 @@ class Trainer:
         assert c.auto_step < c.batch_size, "Auto step must be less than batch size"
 
         # generate a random starting index, and make sure the ending index is not out of bounds
-        start_idx = torch.randint(0, c.batch_size - c.auto_step, (1,))
-        end_idx = start_idx + c.auto_step
+        # start_idx = torch.randint(0, c.batch_size - c.auto_step, (1,))
+        # end_idx = start_idx + c.auto_step
+
+        start_idx = 26
+        end_idx = start_idx + c.auto_step # TODO: remove this later!!!
 
         xlo = xlo[start_idx:end_idx]
         xhi = xhi[start_idx:end_idx]
@@ -841,9 +858,9 @@ class Trainer:
                 }, step=self.step)
 
         # Save checkpoint regularly
-        if self.step % self.config.save_every == 0:
-            logging.info(f"Regularly saving model at step {self.step}\n")
-            self.save_ckpt(best_model=False)
+        # if self.step % self.config.save_every == 0:
+        #     logging.info(f"Regularly saving model at step {self.step}\n")
+        #     self.save_ckpt(best_model=False)
 
         self.step += 1
 
@@ -867,7 +884,6 @@ class Trainer:
                     return
 
                 self.do_step(batch_idx, batch)
-
 
 
 def main():
@@ -905,8 +921,100 @@ def main():
             trainer.sample_ckpt()
     else:
         trainer.fit()
+        
+        '''
+        dataloader = get_dataloader_C(config)
+        logging.info(f"len(dataloader): {len(dataloader)}")
+        lo, hi = next(iter(dataloader))
+        logging.info(f"lo.shape: {lo.shape}")
+        logging.info(f"hi.shape: {hi.shape}")
+        '''
+
+
+
+def tune_grad_scale_for_task(args, grad_scale_list, ratio, results_dict):
+    avg_nrmse_dict = {}
+
+    for grad_scale in grad_scale_list:
+        args.grad_scale = grad_scale
+        config = Config(args)
+        config.log_dir = args.log_dir
+        trainer = Trainer(config)
+        trainer.sample_ckpt_auto()
+
+        avg_nrmse_dict[grad_scale] = trainer.avg_nrmse_dict[grad_scale]
+
+    results_dict[args.task_name + '_' + str(ratio)] = avg_nrmse_dict
+
+    
+
+
+def main_tune_grad_scale_for_all_tasks():
+    torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+    torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+
+    # random seed
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='config.yml')
+    parsed_args = parser.parse_args()
+
+    # make the path to be the folder 'configs' + the config file name
+    config_path = os.path.join('configs', parsed_args.config)
+    
+    log_dir = setup_logger(config_path=config_path)
+
+    with open(config_path, 'r') as f:
+        config_dict = yaml.safe_load(f)
+    args = SimpleNamespace(**config_dict)
+    args.log_dir = log_dir
+
+    assert args.sample_only, "sample_only must be True"
+    assert args.auto, "auto must be True"
+
+    logging.info(f"********* RUNNING at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} using config {parsed_args.config} *********")
+
+    grad_scale_list = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5] # [0.25, 0.5]
+
+    assert args.sample_only, "sample_only must be True"
+    assert args.auto, "auto must be True"
+
+    results_dict = {}
+
+    ########################### SR ###########################
+    args.task_name = 'SR'
+    args.SR_ratio = 4
+    tune_grad_scale_for_task(args, grad_scale_list, args.SR_ratio, results_dict)
+
+    args.task_name = 'SR'
+    args.SR_ratio = 8
+    tune_grad_scale_for_task(args, grad_scale_list, args.SR_ratio, results_dict)
+
+    ########################### SO ###########################
+    args.task_name = 'SO'
+    args.SO_ratio = 0.015625
+    tune_grad_scale_for_task(args, grad_scale_list, args.SO_ratio, results_dict)
+
+    args.task_name = 'SO'
+    args.SO_ratio = 0.05
+    tune_grad_scale_for_task(args, grad_scale_list, args.SO_ratio, results_dict)
+
+    ########################### NRMSE ###########################
+
+    logging.info(f"********* FINISHED SAMPLING *********")
+
+    # print the avg_nrmse_dict with keys and values
+    for task, avg_nrmse_dict in results_dict.items():
+        logging.info(f"********* {task} *********")
+        for grad_scale, avg_nrmse in avg_nrmse_dict.items():
+            logging.info(f"grad_scale: {grad_scale}, avg_nrmse: {avg_nrmse*100:.2f}%")
+ 
+
 
 
 if __name__ == '__main__':
     main()
+    # main_tune_grad_scale_for_all_tasks()
 

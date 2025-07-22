@@ -6,9 +6,9 @@ auto: true
 
 
 # Task configs 
-auto_step: 20 # number of autoregressive steps for sampling
+auto_step: 10 # number of autoregressive steps for sampling
 task_name: 'SR' # super resolution or SO for sparse observation
-SR_ratio: 8 # super resolution ratio
+SR_ratio: 4 # super resolution ratio
 SO_ratio: 0.015625 # sparse observation ratio
 noise_type: 'gaussian'
 noise_sigma: 0.05
@@ -18,7 +18,7 @@ noise_sigma: 0.05
 # Datasets & Checkpoints
 dataset: 'qgv1'
 home: './tmp_images/'
-data_fname: '/scratch/qingqu_root/qingqu/jiayx/FlowDAS/QG/data/qg_v1/qg_full_test.pt'
+data_fname: '/scratch/qingqu_root/qingqu/jiayx/FlowDAS/QG/data/qg_v1/qg_test.pt'
 load_path: '/scratch/qingqu_root/qingqu/jiayx/FlowDAS/QG/ckpts/qg_v1/best.pt'
 lo_size: 128
 hi_size: 128
@@ -26,6 +26,8 @@ time_lag: 2
 subsampling_ratio: 1
 C: 1 # number of dataset channels
 num_classes: 1
+s_in: 1
+s_out: 1
 
 
 
@@ -34,7 +36,7 @@ num_classes: 1
 sigma_coef: 1.0
 beta_fn: t^2
 MC_times: 25
-
+grad_scale: 1 # fine-tune this according to task!!!
 
 
 

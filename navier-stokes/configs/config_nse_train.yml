@@ -6,11 +6,12 @@ auto: false
 
 
 # Datasets & Checkpoints
-dataset: 'qgv2'
+dataset: 'nse'
 home: './tmp_images/'
-data_fname: '/scratch/qingqu_root/qingqu/jiayx/FlowDAS/QG/data/qg_v2/qg_tiny.pt'
+data_fname: '/scratch/qingqu_root/qingqu/jiayx/FlowDAS/NSE/data/data_file.pt'
+# data_fname: './data/nse_data_tiny.pt'
 load_path: null
-lo_size: 128
+lo_size: 64
 hi_size: 128
 time_lag: 2
 subsampling_ratio: 1
@@ -39,7 +40,7 @@ unet_random_fourier_features: false
 
 # Training & sampling
 batch_size: 64
-max_steps: 100_000
+max_steps: 1_000_000
 base_lr: 0.0002
 sampling_batch_size: 1
 EM_sample_steps: 500
@@ -48,13 +49,13 @@ validate_every: 20
 
 
 # Logging
-sample_every: 100
-print_loss_every: 10
-save_every: 100
-ckpt_dir: './ckpts_qg_v2_train'
+sample_every: 2000
+print_loss_every: 20
+save_every: 100000000
+ckpt_dir: './ckpts_nse'
 
 use_wandb: false
-wandb_project: 'qgv2_training'
+wandb_project: 'nse_training'
 wandb_entity: 'jiayx18-university-of-michigan'
 
 
@@ -73,3 +74,4 @@ SR_ratio: 4 # super resolution ratio
 SO_ratio: 0.05 # sparse observation ratio
 noise_type: 'gaussian'
 noise_sigma: 0.05
+grad_scale: 1
