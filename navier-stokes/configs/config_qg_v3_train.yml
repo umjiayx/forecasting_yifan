@@ -1,0 +1,79 @@
+# Command line arguments
+debug: false
+overfit: false
+sample_only: false
+auto: false
+# Note: for fully training, set all above to false
+
+
+# Task configs 
+auto_step: 10 # number of autoregressive steps for sampling
+task_name: 'SO' # super resolution or SO for sparse observation
+SR_ratio: 4 # super resolution ratio
+SO_ratio: 0.05 # sparse observation ratio
+noise_type: 'gaussian'
+noise_sigma: 0.05
+grad_scale: 1
+
+
+# Datasets & Checkpoints
+dataset: 'qgv3'
+home: './tmp_images/'
+data_fname: '/scratch/qingqu_root/qingqu/jiayx/FlowDAS/QG/data/qg_v3/qg_full.pt'
+load_path: None
+lo_size: 128
+hi_size: 128
+time_lag: 3
+subsampling_ratio: 1
+C: 1 # number of dataset channels
+num_classes: 1
+s_in: 1
+s_out: 1
+
+
+
+# Stochastic Interpolants
+sigma_coef: 1.0
+beta_fn: t^2
+
+
+
+
+# Model
+unet_channels: 128
+unet_dim_mults: [1, 2, 2, 2]
+unet_resnet_block_groups: 8
+unet_learned_sinusoidal_dim: 32
+unet_attn_dim_head: 64
+unet_attn_heads: 4
+unet_learned_sinusoidal_cond: true
+unet_random_fourier_features: false
+
+
+
+# Training and Sampling
+batch_size: 64
+max_steps: 100000
+base_lr: 0.0002
+EM_sample_steps: 500
+val_ratio: 0.05
+validate_every: 20
+sampling_batch_size: 1
+MC_times: 25
+
+# Logging
+sample_every: 100
+print_loss_every: 10
+save_every: 100
+ckpt_dir: './ckpts_qg_v3_train' # for saving ckpts
+
+use_wandb: true
+wandb_project: 'qg_v3_train'
+wandb_entity: 'jiayx18-university-of-michigan'
+
+
+
+# Other
+num_workers: 4
+device: 'cuda:0'
+

@@ -4,9 +4,12 @@ ckpts*
 wandb/
 tmp_images/
 logs/
+tmp*
+
 
 # data
 data/
+sampled_frames/
 
 models*
 # other

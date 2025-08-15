@@ -1,0 +1,77 @@
+# Command line arguments
+debug: false
+overfit: false
+sample_only: false
+auto: false
+
+
+# Datasets & Checkpoints
+dataset: 'qgv1_1st_half'
+home: './tmp_images_qgv1_1st_half/'
+data_fname: '/scratch/qingqu_root/qingqu/jiayx/FlowDAS/QG/data/qg_v1/qg_train.pt'
+# data_fname: './data/nse_data_tiny.pt'
+load_path: null
+lo_size: 64
+hi_size: 128
+time_lag: 2
+subsampling_ratio: 1
+C: 1 # number of dataset channels
+num_classes: 1
+s_in: 1
+s_out: 1
+
+# FlowDAS
+sigma_coef: 1.0
+beta_fn: t^2
+MC_times: 25
+
+
+# Model
+unet_channels: 128
+unet_dim_mults: [1, 2, 2, 2]
+unet_resnet_block_groups: 8
+unet_learned_sinusoidal_dim: 32
+unet_attn_dim_head: 64
+unet_attn_heads: 4
+unet_learned_sinusoidal_cond: true
+unet_random_fourier_features: false
+
+
+
+# Training & sampling
+batch_size: 64
+max_steps: 1_000_00
+base_lr: 0.0002
+sampling_batch_size: 1
+EM_sample_steps: 500
+val_ratio: 0.10
+validate_every: 20
+
+
+# Logging
+sample_every: 2000
+print_loss_every: 20
+save_every: 100000000
+ckpt_dir: './ckpts_qg_1st_half'
+
+use_wandb: false
+wandb_project: 'qgv1_1st_half_training'
+wandb_entity: 'jiayx18-university-of-michigan'
+
+
+
+# Other
+num_workers: 4
+device: 'cuda:0'
+
+
+
+##### Not Used for Training #####
+# Task configs 
+auto_step: 1 # number of autoregressive steps for sampling
+task_name: 'SR' # super resolution or SO for sparse observation
+SR_ratio: 4 # super resolution ratio
+SO_ratio: 0.05 # sparse observation ratio
+noise_type: 'gaussian'
+noise_sigma: 0.05
+grad_scale: 1

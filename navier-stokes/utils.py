@@ -38,8 +38,11 @@ class Constants:
     QG_V1_AVG_PIXEL_NORM_TRAIN = 0.6351982153248673
     QG_V1_AVG_PIXEL_NORM_FULL = 0.6352024454011677
 
+    QG_V1_AVG_PIXEL_NORM_TRAIN_HALF = 0.475635826587677
+
     QG_V2_AVG_PIXEL_NORM_TRAIN = 1.0793864383430332
     QG_V2_AVG_PIXEL_NORM_FULL = 1.079314860803363
+    QG_V3_AVG_PIXEL_NORM_TRAIN = 0.3492
 
     NSE_AVG_PIXEL_NORM = 3.0679163932800293
 
@@ -77,26 +80,11 @@ class Config:
             self.data_path = '../data/'
             self.grid_kwargs = {'normalize' : True, 'value_range' : (-1, 1)}
 
-        elif self.dataset == 'nse':
+        elif self.dataset == 'nse' or 'qg' in self.dataset or 'square' in self.dataset:
             self.center_data = False
             self.home = args.home
             maybe_create_dir(self.home)
             self.data_fname = args.data_fname # to be changed to full data.
-            self.num_classes = args.num_classes
-            self.lo_size = args.lo_size
-            self.hi_size = args.hi_size
-            self.time_lag = args.time_lag
-            self.subsampling_ratio = args.subsampling_ratio
-            self.grid_kwargs = {'normalize': False}
-            self.C = args.C
-            self.H = self.hi_size
-            self.W = self.hi_size
-        
-        elif 'qg' in self.dataset:
-            self.center_data = False
-            self.home = args.home
-            maybe_create_dir(self.home)
-            self.data_fname = args.data_fname
             self.num_classes = args.num_classes
             self.lo_size = args.lo_size
             self.hi_size = args.hi_size
@@ -308,6 +296,14 @@ def maybe_subsample(x, subsampling_ratio):
     return x
 
 def maybe_lag(data, time_lag):
+    """
+    Args:
+        data: (N, T, H, W)
+        time_lag: int
+    Returns:
+        inputs: (N, T-time_lag, H, W)
+        outputs: (N, T-time_lag, H, W)
+    """
     if time_lag > 0:
         inputs = data[:, :-time_lag, ...]
         outputs = data[:, time_lag:, ...]
@@ -335,21 +331,24 @@ def loader_from_tensor(lo, hi, batch_size, shuffle):
 def compute_avg_pixel_norm(data_raw):
     return torch.sqrt(torch.mean(data_raw ** 2))
 
-def get_avg_pixel_norm(config):
+def get_avg_pixel_norm(config, data):
     if config.dataset == 'qgv1':
         return Constants.QG_V1_AVG_PIXEL_NORM_TRAIN
     elif config.dataset == 'qgv2':
         return Constants.QG_V2_AVG_PIXEL_NORM_TRAIN
     elif config.dataset == 'qgv3':
-        assert False, "Not implemented yet!"
+        return Constants.QG_V3_AVG_PIXEL_NORM_TRAIN
     elif config.dataset == 'qgv4':
         assert False, "Not implemented yet!"
     elif config.dataset == 'nse':
         return Constants.NSE_AVG_PIXEL_NORM
     else:
+        if 'half' in config.dataset:
+            logging.info(f"Notice: using avg_pixel_norm computed from data for {config.dataset}")
+            return compute_avg_pixel_norm(data)
         raise ValueError(f"Dataset {config.dataset} is not supported")
 
-def get_forecasting_dataloader_nse(config, shuffle = False):
+def get_forecasting_dataloader_nse(config, shuffle=False):
     data_raw, time_raw = torch.load(config.data_fname)
     del time_raw
     
@@ -421,7 +420,7 @@ def get_forecasting_dataloader_nse(config, shuffle = False):
 
     return train_loader, val_loader, avg_pixel_norm, new_avg_pixel_norm
 
-def get_forecasting_dataloader_qg(config, shuffle = False):
+def get_forecasting_dataloader_qg(config, shuffle=False):
     data_raw = torch.load(config.data_fname)
     data_raw = data_raw.float()
 
@@ -432,11 +431,82 @@ def get_forecasting_dataloader_qg(config, shuffle = False):
 
     ans = input("Have you update the avg_pixel_norm for the dataset? (y/n): ")
     if ans == 'y' or ans == '':
-        avg_pixel_norm = get_avg_pixel_norm(config)
+        avg_pixel_norm = get_avg_pixel_norm(config, data_raw)
         logging.info(f"avg_pixel_norm: {avg_pixel_norm}")
     else:
         avg_pixel_norm = 1.0
         assert False, "You must update the avg_pixel_norm for the dataset!"
+
+    # avg_pixel_norm = compute_avg_pixel_norm(data_raw)
+    data = data_raw/avg_pixel_norm
+    new_avg_pixel_norm = 1.0
+
+    logging.info("\n\n********* DATA *********\n\n")
+
+    logging.info(f"avg_pixel_norm: {avg_pixel_norm}")
+
+    # here "lo" will be the conditioning info (initial condition) and "hi" will be the target
+    # lo is x_t and hi is x_{t+tau}, and lo might be lower res than hi
+
+    logging.info(f"data_raw.shape: {data_raw.shape}")
+    logging.info(f"config.time_lag: {config.time_lag}")
+    logging.info(f"config.lo_size: {config.lo_size}")
+    logging.info(f"config.hi_size: {config.hi_size}")
+    logging.info(f"config.subsampling_ratio: {config.subsampling_ratio}")
+    logging.info(f"config.batch_size: {config.batch_size}")
+
+    logging.info("\n")
+
+    lo, hi = maybe_lag(data, config.time_lag)
+
+    # logging.info(f"lo.shape after maybe_lag: {lo.shape}")
+    # logging.info(f"hi.shape after maybe_lag: {hi.shape}")
+
+    logging.info("\n")
+
+    lo, hi = flatten_time(lo, hi, config.hi_size)
+
+    # logging.info(f"lo.shape after flatten_time: {lo.shape}")
+    # logging.info(f"hi.shape after flatten_time: {hi.shape}")
+
+    # logging.info("\n")
+
+    lo = maybe_subsample(lo, config.subsampling_ratio)
+    hi = maybe_subsample(hi, config.subsampling_ratio)
+
+    logging.info(f"shape of the dataset (lo): {lo.shape}")
+    logging.info(f"shape of the dataset (hi): {hi.shape}")
+
+    # logging.info("\n")
+
+    # now they are image shaped. Be sure to shuffle to de-correlate neighboring samples when training. 
+    # loader = loader_from_tensor(lo, hi, config.batch_size, shuffle = shuffle)
+
+    dataset = TensorDataset(lo, hi)
+
+    # split into train and val according to config.val_ratio
+    N = len(dataset)
+    val_size = int(N * config.val_ratio)
+    train_size = N - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)
+    
+    return train_loader, val_loader, avg_pixel_norm, new_avg_pixel_norm
+
+def get_forecasting_dataloader_qg_half(config, shuffle=False):
+    data_raw = torch.load(config.data_fname)
+    data_raw = data_raw.float()
+
+    half_T = data_raw.shape[1] // 2
+    data_raw = data_raw[:, :half_T]
+
+    # better to subsample after flattening time dim to actually affect the num of datapoints rather than num trajectores
+    #data_raw = maybe_subsample(data_raw, config.subsampling_ratio)    
+    
+    # avg_pixel_norm = 3.0679163932800293 # avg data norm computed a priori
+
+    avg_pixel_norm = get_avg_pixel_norm(config, data_raw)
 
     # avg_pixel_norm = compute_avg_pixel_norm(data_raw)
     data = data_raw/avg_pixel_norm
@@ -528,7 +598,9 @@ def get_forecasting_dataloader_qg_sampling(config):
 
     logging.info("\n")
 
-    lo, hi = maybe_lag(data, config.time_lag)
+    lo, hi = maybe_lag(data, config.time_lag) # (N, T-time_lag, H, W)
+
+    config.max_T = lo.shape[1] # length of the longest trajectory
 
     # logging.info(f"lo.shape after maybe_lag: {lo.shape}")
     # logging.info(f"hi.shape after maybe_lag: {hi.shape}")
@@ -566,6 +638,74 @@ def get_forecasting_dataloader_qg_sampling(config):
     N = len(dataset)
     test_loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=False)
 
+    return test_loader, avg_pixel_norm
+
+def get_forecasting_dataloader_qg_half_sampling(config, shuffle = False):
+    data_raw = torch.load(config.data_fname)
+    data_raw = data_raw.float()
+
+    half_T = data_raw.shape[1] // 2
+    data_raw = data_raw[:, half_T:]
+
+    # better to subsample after flattening time dim to actually affect the num of datapoints rather than num trajectores
+    #data_raw = maybe_subsample(data_raw, config.subsampling_ratio)    
+    
+    # avg_pixel_norm = 3.0679163932800293 # avg data norm computed a priori
+
+    avg_pixel_norm = Constants.QG_V1_AVG_PIXEL_NORM_TRAIN_HALF
+
+    # avg_pixel_norm = compute_avg_pixel_norm(data_raw)
+    data = data_raw/avg_pixel_norm
+    new_avg_pixel_norm = 1.0
+
+    logging.info("\n\n********* DATA *********\n\n")
+
+    logging.info(f"avg_pixel_norm: {avg_pixel_norm}")
+
+    # here "lo" will be the conditioning info (initial condition) and "hi" will be the target
+    # lo is x_t and hi is x_{t+tau}, and lo might be lower res than hi
+
+    logging.info(f"data_raw.shape: {data_raw.shape}")
+    logging.info(f"config.time_lag: {config.time_lag}")
+    logging.info(f"config.lo_size: {config.lo_size}")
+    logging.info(f"config.hi_size: {config.hi_size}")
+    logging.info(f"config.subsampling_ratio: {config.subsampling_ratio}")
+    logging.info(f"config.batch_size: {config.batch_size}")
+
+    logging.info("\n")
+
+    lo, hi = maybe_lag(data, config.time_lag)
+    
+    config.max_T = lo.shape[1] # length of the longest trajectory
+    # logging.info(f"lo.shape after maybe_lag: {lo.shape}")
+    # logging.info(f"hi.shape after maybe_lag: {hi.shape}")
+
+    logging.info("\n")
+
+    lo, hi = flatten_time(lo, hi, config.hi_size)
+
+    # logging.info(f"lo.shape after flatten_time: {lo.shape}")
+    # logging.info(f"hi.shape after flatten_time: {hi.shape}")
+
+    # logging.info("\n")
+
+    lo = maybe_subsample(lo, config.subsampling_ratio)
+    hi = maybe_subsample(hi, config.subsampling_ratio)
+
+    logging.info(f"shape of the dataset (lo): {lo.shape}")
+    logging.info(f"shape of the dataset (hi): {hi.shape}")
+
+    # logging.info("\n")
+
+    # now they are image shaped. Be sure to shuffle to de-correlate neighboring samples when training. 
+    # loader = loader_from_tensor(lo, hi, config.batch_size, shuffle = shuffle)
+
+    dataset = TensorDataset(lo, hi)
+
+    # split into train and val according to config.val_ratio
+    N = len(dataset)
+    test_loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=False)
+    
     return test_loader, avg_pixel_norm
 
 def extract_patches(inputs, outputs, s_in, s_out):

@@ -41,6 +41,8 @@ from utils import (
     get_forecasting_dataloader_qg_half_sampling,
 )
 
+from utils_toy import get_forecasting_dataloader_square, get_forecasting_dataloader_square_sampling
+
 from measurements import get_operator, get_noiser
 
 
@@ -77,7 +79,8 @@ class Trainer:
 
         # Datasets
         if c.sample_only:
-            self.test_loader, avg_pixel_norm = get_forecasting_dataloader_qg_half_sampling(c)
+            # self.test_loader, avg_pixel_norm = get_forecasting_dataloader_qg_half_sampling(c)
+            self.test_loader = get_forecasting_dataloader_square_sampling(c)
             self.test_batch = next(iter(self.test_loader))
         else:
             if c.dataset == 'cifar':
@@ -96,6 +99,10 @@ class Trainer:
                 else:
                     self.train_loader, self.val_loader, old_pixel_norm, new_pixel_norm=get_forecasting_dataloader_qg(c)
                 # self.train_loader = get_dataloader_C(c) # TODO: remove this later!!!
+                c.old_pixel_norm = old_pixel_norm # TODO: uncomment this later!!!
+                c.new_pixel_norm = new_pixel_norm # TODO: uncomment this later!!!
+            elif 'square' in c.dataset:
+                self.train_loader, self.val_loader, old_pixel_norm, new_pixel_norm=get_forecasting_dataloader_square(c)
                 c.old_pixel_norm = old_pixel_norm # TODO: uncomment this later!!!
                 c.new_pixel_norm = new_pixel_norm # TODO: uncomment this later!!!
             else:
@@ -175,7 +182,8 @@ class Trainer:
         return numer / denom # Eq (10) in the paper
 
     def compute_nrmse(self, z1, sample):
-        return torch.linalg.norm(z1 - sample, ord='fro') / torch.linalg.norm(z1, ord='fro')
+        # return torch.linalg.norm(z1 - sample, ord='fro') / torch.linalg.norm(z1, ord='fro')
+        return torch.sqrt(torch.sum((z1 - sample)**2)) / torch.sqrt(torch.sum(z1**2))
 
     @torch.no_grad()
     def EM(self, base=None, label=None, cond=None, diffusion_fn=None):
@@ -417,7 +425,7 @@ class Trainer:
             preprocess_fn = lambda x : to_grid(x, c.grid_kwargs)
 
         else:
-            assert c.dataset == 'nse' or 'qg' in c.dataset
+            assert c.dataset == 'nse' or 'qg' in c.dataset or 'square' in c.dataset
             preprocess_fn = lambda x, name: to_grid(make_redblue_plots(x, c, name), c.grid_kwargs)
 
         # logging.info(f"D['z1'].shape: {D['z1'].shape}") # (4, 1, 128, 128)
@@ -488,7 +496,7 @@ class Trainer:
         if c.dataset == 'cifar':
             preprocess_fn = lambda x : to_grid(x, c.grid_kwargs)
         else:
-            assert c.dataset == 'nse' or 'qg' in c.dataset
+            assert c.dataset == 'nse' or 'qg' in c.dataset or 'square' in c.dataset
             preprocess_fn = lambda x, name: to_grid(make_redblue_plots(x, c, name), c.grid_kwargs)
 
         sample = None
@@ -521,12 +529,15 @@ class Trainer:
     
         # Plot (z1, measurement, sample) for all steps
         for step in range(c.auto_step):
+            z0 = D['z0'][step].unsqueeze(0) # (1, C, H, W)
             z1 = D['z1'][step].unsqueeze(0) # (1, C, H, W)
             measurement = measurements[step].unsqueeze(0) # (1, C, H, W)
             sample = all_samples[step] # (1, C, H, W)
             error = z1 - sample # (1, C, H, W)
 
             # logging.info(f"error.max(): {error.square().sqrt().max().item():.4f}")
+            logging.info(f"z1.shape: {z1.shape}")
+            logging.info(f"sample.shape: {sample.shape}")
 
             nrmse = self.compute_nrmse(z1, sample)
             nrmse_list.append(nrmse)
@@ -535,17 +546,27 @@ class Trainer:
             # logging.info(f"z1.shape: {z1.shape}")
             # logging.info(f"measurement.shape: {measurement.shape}")
             # logging.info(f"sample.shape: {sample.shape}")
-
+            
+            z0_plot = preprocess_fn(z0, 'z0') # (3, 251, 250)
             z1_plot = preprocess_fn(z1, 'z1') # (3, 251, 250)
             measurement_plot = preprocess_fn(measurement, 'measurement') # (3, 251, 250)
             sample_plot = preprocess_fn(sample, 'sample') # (3, 251, 250)
             error_plot = preprocess_fn(error, 'error') # (3, 251, 250)
 
+            # save z0, z1, measurement, sample, error to a .pt file, named as step_0.pt, step_1.pt, ... in the home directory
+            torch.save({
+                'z0': z0,
+                'z1': z1,
+                'measurement': measurement,
+                'sample': sample,
+                'error': error
+            }, f'{c.home}/step_{step}.pt')
+
             # logging.info(f"z1_plot.shape: {z1_plot.shape}")
             # logging.info(f"measurement_plot.shape: {measurement_plot.shape}")
             # logging.info(f"sample_plot.shape: {sample_plot.shape}")
 
-            all_tensors_step = torch.cat([measurement_plot, z1_plot, sample_plot, error_plot], dim=-2) 
+            all_tensors_step = torch.cat([z0_plot, measurement_plot, z1_plot, sample_plot, error_plot], dim=-2) 
             # logging.info(f"all_tensors_step.shape: {all_tensors_step.shape}")
 
             all_tensors.append(all_tensors_step)
@@ -560,7 +581,7 @@ class Trainer:
         # logging.info(f"all_tensors.device: {all_tensors.device}")
         # logging.info(f"all_tensors.shape: {all_tensors.shape}")
 
-        plotD['g_sigma' + "(GT, measurement, FlowDAS)"] = wandb.Image(all_tensors)
+        plotD['g_sigma' + "(z0, measurement, GT, FlowDAS, error)"] = wandb.Image(all_tensors)
 
         # log the nrmse_list to wandb and see the curve
         # plotD['nrmse'] = wandb.Image(nrmse_list)
@@ -678,6 +699,22 @@ class Trainer:
         y = None
         D = {'z0': xlo, 'z1': xhi, 'label': y, 'N': N}
         return D
+    
+    @torch.no_grad()
+    def prepare_batch_square(self, batch=None, for_sampling=False):
+        assert not self.config.center_data
+
+        xlo, xhi = batch
+
+        if for_sampling:
+            xlo = xlo[:self.config.sampling_batch_size]
+            xhi = xhi[:self.config.sampling_batch_size]
+
+        xlo, xhi = xlo.to(self.device), xhi.to(self.device)
+        N = xlo.shape[0]
+        y = None
+        D = {'z0': xlo, 'z1': xhi, 'label': y, 'N': N}
+        return D
 
     @torch.no_grad()
     def prepare_batch_cifar(self, batch=None, for_sampling=False):
@@ -701,6 +738,7 @@ class Trainer:
         D['z0'] = torch.zeros_like(D['z1'])
 
         return D
+
 
     @torch.no_grad()
     def prepare_batch(self, batch=None, for_sampling=False):
@@ -726,8 +764,10 @@ class Trainer:
             D = self.prepare_batch_nse(batch, for_sampling=for_sampling)
         elif 'qg' in self.config.dataset:
             D = self.prepare_batch_qg(batch, for_sampling=for_sampling)
+        elif 'square' in self.config.dataset:
+            D = self.prepare_batch_square(batch, for_sampling=for_sampling)
         else:
-            assert False, "dataset must be 'cifar', 'nse', or 'qg'"
+            assert False, "dataset must be 'cifar', 'nse', 'qg', or 'square' or 'multi_squares'"
 
         D = self.update_D(D)
    
@@ -754,7 +794,7 @@ class Trainer:
         # start_idx = torch.randint(0, c.batch_size - c.auto_step, (1,))
         # end_idx = start_idx + c.auto_step
 
-        start_idx = 26
+        start_idx = 8
         end_idx = start_idx + c.auto_step # TODO: remove this later!!!
 
         # to avoid the case where the range contains multiple trajectories (i.e., jump to another trajectory)
@@ -1027,5 +1067,4 @@ def main_tune_grad_scale_for_all_tasks():
 
 if __name__ == '__main__':
     main()
-    # main_tune_grad_scale_for_all_tasks()
 
